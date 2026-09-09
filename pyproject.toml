@@ -1,0 +1,67 @@
+[project]
+name = "surfsky-mcp"
+version = "0.1.0"
+description = "MCP server for the Surfsky antidetect cloud browser: scrape, browse and automate bot-protected sites from any MCP host."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+keywords = ["surfsky", "mcp", "browser", "automation", "scraping", "antidetect", "agents"]
+authors = [{ name = "Surfsky SDK contributors" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "mcp>=2.2,<3",
+    "surfsky>=0.0.8,<0.1",
+    "surfsky-cli>=0.0.7,<0.1",
+    "anyio>=4.4",
+]
+
+[project.scripts]
+surfsky-mcp = "surfsky_mcp.server:main"
+
+[project.urls]
+Homepage = "https://surfsky.io"
+Documentation = "https://docs.surfsky.io"
+Repository = "https://github.com/surfskyio/surfsky-mcp"
+Issues = "https://github.com/surfskyio/surfsky-mcp/issues"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.6", "ty>=0.0.56"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/surfsky_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 90
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]
+"src/surfsky_mcp/server.py" = ["E402"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["src"]

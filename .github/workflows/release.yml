@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.12"
+      - run: test "v$(uv version --short)" = "$GITHUB_REF_NAME"
+      - run: uv sync --locked --all-groups
+      - run: uv run pytest -q
+      - run: uv build
+      - run: uv run --isolated --no-project --with dist/*.whl python -c "import surfsky_mcp; print(surfsky_mcp.__version__)"
+      - run: uv run --isolated --no-project --with dist/*.tar.gz python -c "import surfsky_mcp"
+      - run: uv publish
