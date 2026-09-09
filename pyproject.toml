@@ -1,6 +1,6 @@
 [project]
 name = "surfsky-mcp"
-version = "0.1.0"
+version = "0.0.1"
 description = "MCP server for the Surfsky antidetect cloud browser: scrape, browse and automate bot-protected sites from any MCP host."
 readme = "README.md"
 requires-python = ">=3.12"
