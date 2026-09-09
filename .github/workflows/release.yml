@@ -20,6 +20,6 @@ jobs:
       - run: uv sync --locked --all-groups
       - run: uv run pytest -q
       - run: uv build
-      - run: uv run --isolated --no-project --with dist/*.whl python -c "import surfsky_mcp; print(surfsky_mcp.__version__)"
-      - run: uv run --isolated --no-project --with dist/*.tar.gz python -c "import surfsky_mcp"
-      - run: uv publish
+      - run: uv run --isolated --no-project --with dist/*.whl surfsky-mcp --version
+      - run: uv run --isolated --no-project --with dist/*.tar.gz surfsky-mcp --version
+      - run: uv publish --check-url https://pypi.org/simple/surfsky-mcp/
