@@ -12,6 +12,7 @@ import click
 from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
+from surfsky import BrowserTimeoutError
 from surfsky_cli import html, snapshot
 from surfsky_cli import session as cli
 from surfsky_cli.commands.scrape import build, with_scheme
@@ -198,6 +199,19 @@ def session_options(
         return cli.session_kwargs(opts)
     except click.UsageError as exc:
         raise UsageError(exc.format_message()) from exc
+
+
+async def navigate(
+    page: Any, nav: Awaitable[Any], wait_until: str, before: str
+) -> str | None:
+    """Run a navigation, tolerating a lifecycle event that never arrives."""
+    try:
+        await nav
+    except BrowserTimeoutError:
+        if await page.url() == before:
+            raise
+        return f"navigation did not reach '{wait_until}'; the page may be partly loaded"
+    return None
 
 
 async def page_state(
@@ -461,14 +475,16 @@ async def surfsky_navigate(
         page = live.page
         before = await page.url()
         if url is not None:
-            await page.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
+            nav = page.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
         elif go == "reload":
-            await page.reload(wait_until=wait_until, timeout=timeout)
+            nav = page.reload(wait_until=wait_until, timeout=timeout)
         else:
             step = page.go_back if go == "back" else page.go_forward
             if await step(timeout=timeout) is None:
                 raise UsageError("no further history")
-            await page.wait_for_load_state(wait_until, timeout=timeout)
+            nav = page.wait_for_load_state(wait_until, timeout=timeout)
+        if note := await navigate(page, nav, wait_until, before):
+            live.note = f"{live.note}; {note}" if live.note else note
         return await action_result(live, before, want_snapshot=snapshot, status=True)
 
 
@@ -991,7 +1007,9 @@ async def surfsky_scrape(
     client = get_registry(ctx).client()
     # The SDK stops the session on exit and shields that stop from cancellation.
     async with client.browser(profile_uuid=profile_uuid, **options) as browser:
-        await browser.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
+        before = await browser.url()
+        nav = browser.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
+        note = await navigate(browser, nav, wait_until, before)
         if wait_for:
             await browser.wait_for_selector(wait_for, timeout=timeout)
         data: dict[str, Any] = {
@@ -1008,6 +1026,7 @@ async def surfsky_scrape(
     text_formats = [name for name in wanted if name != "screenshot"]
     built = build(data, text_formats, main_content=only_main_content)
     header: dict[str, Any] = {"url": built["url"], "status": built["status"]}
+    header["note"] = note
     page: dict[str, Any] = {"title": built["title"]}
     parts: list[str] = []
     cut: list[str] = []

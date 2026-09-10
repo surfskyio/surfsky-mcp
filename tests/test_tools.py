@@ -1,9 +1,9 @@
 import anyio
 import pytest
 from mcp.types import ImageContent
-from surfsky import ConfigurationError
+from surfsky import BrowserTimeoutError, ConfigurationError
 
-from tests.conftest import error_of, text_of
+from tests.conftest import FakePage, error_of, text_of
 
 pytestmark = pytest.mark.anyio
 
@@ -596,3 +596,37 @@ async def test_scrape_one_text_format_plus_screenshot_has_no_heading(client, fak
         isinstance(result.content[1], ImageContent)
         and result.content[1].mime_type == "image/jpeg"
     )
+
+
+def timing_out(committed: bool):
+    async def goto(self, url, **kwargs):
+        if committed:
+            self._url, self._title = url, "Page " + url
+        raise BrowserTimeoutError(
+            f"navigation to {url} did not reach 'load' within 30.0s"
+        )
+
+    return goto
+
+
+async def test_scrape_keeps_a_page_whose_load_event_never_lands(client, monkeypatch):
+    monkeypatch.setattr(FakePage, "goto", timing_out(committed=True))
+    result = await client.call_tool("surfsky_scrape", {"url": "https://slow.test"})
+    assert not result.is_error, text_of(result)
+    data = result.structured_content
+    assert "partly loaded" in data["note"] and data["page"]["markdown"]
+
+
+async def test_scrape_fails_when_no_document_arrives(client, monkeypatch):
+    monkeypatch.setattr(FakePage, "goto", timing_out(committed=False))
+    result = await client.call_tool("surfsky_scrape", {"url": "https://dead.test"})
+    assert error_of(result)["code"] == "timeout"
+
+
+async def test_navigate_keeps_a_page_whose_load_event_never_lands(client, monkeypatch):
+    await client.call_tool("surfsky_navigate", {"url": "https://e.test"})
+    monkeypatch.setattr(FakePage, "goto", timing_out(committed=True))
+    result = await client.call_tool("surfsky_navigate", {"url": "https://slow.test"})
+    assert not result.is_error, text_of(result)
+    header = result.structured_content
+    assert "partly loaded" in header["note"] and header["navigated"] is True
