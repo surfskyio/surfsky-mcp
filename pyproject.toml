@@ -1,6 +1,6 @@
 [project]
 name = "surfsky-mcp"
-version = "0.0.2"
+version = "0.0.3"
 description = "MCP server for the Surfsky antidetect cloud browser: scrape, browse and automate bot-protected sites from any MCP host."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,7 +18,7 @@ classifiers = [
 dependencies = [
     "mcp>=2.2,<3",
     "surfsky>=0.0.8,<0.1",
-    "surfsky-cli>=0.0.7,<0.1",
+    "surfsky-cli>=0.0.8,<0.1",
     "anyio>=4.4",
 ]
 
