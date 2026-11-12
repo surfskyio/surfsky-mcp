@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from surfsky import Browser, Inspector, NotFoundError, ServerError, Session
 from surfsky.browser.actions import Keyboard, Mouse
+from surfsky.types import ScrapeResult
 
 HTML = '<html><body><h1>Hi</h1><p>Text <a href="/x">x</a></p></body></html>'
 WALK = {
@@ -218,6 +219,8 @@ class FakeClient:
         self.base_url = "https://api.test"
         self.closed = False
         self.browsers = []
+        self.scrapes = []
+        self.challenge = None
 
     def with_options(self, **_):
         return self
@@ -230,6 +233,20 @@ class FakeClient:
 
     async def __aexit__(self, *exc):
         await self.aclose()
+
+    async def scrape(self, url, **kwargs):
+        self.scrapes.append((url, kwargs))
+        formats = kwargs["formats"]
+        return ScrapeResult(
+            url=url,
+            final_url=url,
+            status=200,
+            title="Hi",
+            markdown="# Hi\n\nText [x](/x)" if "markdown" in formats else None,
+            links=["https://e.test/x"] if "links" in formats else None,
+            screenshot="/9j/" if "screenshot" in formats else None,
+            challenge=self.challenge,
+        )
 
     @asynccontextmanager
     async def browser(self, **kwargs):

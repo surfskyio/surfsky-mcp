@@ -75,7 +75,7 @@ Logs go to stderr; stdout carries JSON-RPC only.
 
 | Ask                                                      | What happens                                                                                                                                                       |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| "Read this page and summarize the reviews."              | One `surfsky_scrape`. Starts no session, so nothing to stop                                                                                                        |
+| "Read this page and summarize the reviews."              | One `surfsky_scrape` through the Scraping API. No session                                                                                                          |
 | "Compare this product's price across these three shops." | Three scrapes. A shop that needs a click to show the price gets a session                                                                                          |
 | "Fill this form with the details from my notes."         | `surfsky_snapshot` for `@N` references, then `surfsky_act`. The server tells the model to stop short of a payment or a final confirmation unless you asked for one |
 | "Sign in and check last month's invoice."                | `surfsky_session_start` with a `profile_uuid` you supply; the saved profile carries the login                                                                      |
@@ -107,7 +107,9 @@ on first use and stops after five minutes idle or on server shutdown. Call
 `surfsky_session_stop` to stop billing immediately.
 
 Use `surfsky_session_start` for separate sessions, saved profiles or custom
-proxy and fingerprint settings. `surfsky_scrape` stops its browser automatically.
+proxy and fingerprint settings. `surfsky_scrape` goes through the Scraping API,
+which serves the page from a pre-started browser; given a `profile_uuid`, a proxy
+or an `os`, it starts a browser of its own and stops it when done.
 Sessions can also be listed and stopped through the
 [Surfsky CLI](https://github.com/surfskyio/surfsky-cli).
 
@@ -127,8 +129,9 @@ Clients sharing a server must use separate `session_id` values.
 ## Troubleshooting
 
 **A page returns 200 but the text is short, or asks you to continue shopping or
-prove you are human.** That is a bot challenge, not a bug. Each scrape gets a
-fresh browser and a different proxy exit, so a retry often gets through. If a
+prove you are human.** That is a bot challenge, not a bug. The Scraping API
+passes most of them itself and each scrape gets a different proxy exit, so a
+retry often gets through. If a
 site blocks every fresh browser, start a session with a saved `profile_uuid`,
 whose cookies survive between runs.
 

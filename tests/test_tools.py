@@ -2,6 +2,7 @@ import anyio
 import pytest
 from mcp.types import ImageContent
 from surfsky import BrowserTimeoutError, ConfigurationError
+from surfsky.types import ScrapeChallenge
 
 from tests.conftest import FakePage, error_of, text_of
 
@@ -547,6 +548,31 @@ async def test_scrape_uses_a_throwaway_browser(client, fakes):
     )
 
 
+async def test_scrape_goes_to_the_scraping_api_by_default(client, fakes):
+    fakes.client.challenge = ScrapeChallenge(
+        kind="challenge_page", solved=True, cost="0.001"
+    )
+    result = await client.call_tool(
+        "surfsky_scrape",
+        {
+            "url": "e.test",
+            "formats": ["markdown", "links", "screenshot"],
+            "only_main_content": True,
+            "block_resources": ["font"],
+            "timeout": 5,
+        },
+    )
+    (url, sent), data = fakes.client.scrapes[0], result.structured_content
+    assert fakes.client.browsers == [] and url == "https://e.test"
+    assert sent["formats"] == ["markdown", "links", "screenshot"]
+    assert sent["only_main_content"] is True and sent["timeout"] == 5000
+    assert sent["block_resources"] == ["font"] and sent["wait_until"] == "load"
+    assert sent["screenshot_options"].format == "jpeg"
+    assert data["status"] == 200 and data["note"] == "challenge_page met, solved"
+    assert data["page"]["links"] == "https://e.test/x" and "# Hi" in text_of(result)
+    assert result.content[1].mime_type == "image/jpeg"
+
+
 async def test_scrape_defaults_and_truncation(client, fakes):
     result = await client.call_tool(
         "surfsky_scrape", {"url": "https://e.test/", "max_chars": 5}
@@ -611,7 +637,9 @@ def timing_out(committed: bool):
 
 async def test_scrape_keeps_a_page_whose_load_event_never_lands(client, monkeypatch):
     monkeypatch.setattr(FakePage, "goto", timing_out(committed=True))
-    result = await client.call_tool("surfsky_scrape", {"url": "https://slow.test"})
+    result = await client.call_tool(
+        "surfsky_scrape", {"url": "https://slow.test", "os": "mac"}
+    )
     assert not result.is_error, text_of(result)
     data = result.structured_content
     assert "partly loaded" in data["note"] and data["page"]["markdown"]
@@ -619,7 +647,9 @@ async def test_scrape_keeps_a_page_whose_load_event_never_lands(client, monkeypa
 
 async def test_scrape_fails_when_no_document_arrives(client, monkeypatch):
     monkeypatch.setattr(FakePage, "goto", timing_out(committed=False))
-    result = await client.call_tool("surfsky_scrape", {"url": "https://dead.test"})
+    result = await client.call_tool(
+        "surfsky_scrape", {"url": "https://dead.test", "os": "mac"}
+    )
     assert error_of(result)["code"] == "timeout"
 
 

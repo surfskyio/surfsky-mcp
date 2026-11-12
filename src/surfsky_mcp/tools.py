@@ -1,3 +1,4 @@
+import base64
 import functools
 import hashlib
 import inspect
@@ -13,6 +14,7 @@ from mcp.server.mcpserver import Context
 from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
 from surfsky import BrowserTimeoutError
+from surfsky.types import ScreenshotOptions
 from surfsky_cli import html, snapshot
 from surfsky_cli import session as cli
 from surfsky_cli.commands.scrape import build, with_scheme
@@ -988,15 +990,16 @@ async def surfsky_scrape(
     os: OS = None,
     block_resources: Blocked = None,
 ) -> CallToolResult:
-    """Fetch one URL in a throwaway cloud browser and return it as markdown (default),
-    cleaned html, a list of links, and/or a viewport screenshot, with the final url, HTTP
-    status and title. Use it whenever you only need to read a page: it starts no session,
-    so there is nothing to stop, and it runs a real browser behind a residential proxy
-    like the session tools. For a page that needs clicks, scrolling, a form or an interactive login, use
-    surfsky_navigate, surfsky_act and surfsky_read; for a saved login pass profile_uuid
-    here. A status of 200 with a short page may be a challenge page: read the content
-    before trusting it. Text longer than max_chars is cut with a marker. Each call bills
-    one short session.
+    """Fetch one URL and return it as markdown (default), cleaned html, a list of links,
+    and/or a viewport screenshot, with the final url, HTTP status and title. Use it
+    whenever you only need to read a page: the Scraping API serves it from a pre-started
+    browser behind a residential proxy and passes challenge pages and captchas, with no
+    session to stop. profile_uuid (a saved login), proxy, country, region, city,
+    proxy_type or os start a throwaway browser for this call instead: slower, so pass
+    them only when needed. For a page that needs clicks, scrolling, a form or an
+    interactive login, use surfsky_navigate, surfsky_act and surfsky_read. A status of
+    200 with a short page may be a challenge page: read the content before trusting it.
+    Text longer than max_chars is cut with a marker. Each call is billed.
     """
     if profile_uuid and os:
         raise UsageError("a profile owns its fingerprint: drop os, or drop profile_uuid")
@@ -1005,29 +1008,57 @@ async def surfsky_scrape(
         proxy, country, region, city, proxy_type, os, None, None, block_resources
     )
     client = get_registry(ctx).client()
-    # The SDK stops the session on exit and shields that stop from cancellation.
-    async with client.browser(profile_uuid=profile_uuid, **options) as browser:
-        before = await browser.url()
-        nav = browser.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
-        note = await navigate(browser, nav, wait_until, before)
-        if wait_for:
-            await browser.wait_for_selector(wait_for, timeout=timeout)
-        data: dict[str, Any] = {
-            "url": await browser.url(),
-            "status": browser.status,
-            "title": await browser.title(),
-            "raw_html": await browser.content(),
-        }
-        image = (
-            await browser.screenshot(format="jpeg", quality=60)
-            if "screenshot" in wanted
-            else None
-        )
     text_formats = [name for name in wanted if name != "screenshot"]
-    built = build(data, text_formats, main_content=only_main_content)
-    header: dict[str, Any] = {"url": built["url"], "status": built["status"]}
+    if not (profile_uuid or options.keys() - {"block_resources"}):
+        scraped = await client.scrape(
+            with_scheme(url),
+            formats=cast(Any, wanted),
+            only_main_content=only_main_content,
+            screenshot_options=ScreenshotOptions(
+                full_page=False, format="jpeg", quality=60
+            ),
+            wait_until=wait_until,
+            wait_for=wait_for,
+            timeout=int(timeout * 1000),
+            block_resources=block_resources,
+        )
+        built: dict[str, Any] = {
+            "url": scraped.final_url or scraped.url,
+            "status": scraped.status,
+            "title": scraped.title,
+            "markdown": scraped.markdown,
+            "html": scraped.content,
+            "links": scraped.links,
+        }
+        built = {name: value for name, value in built.items() if value is not None}
+        image = base64.b64decode(scraped.screenshot) if scraped.screenshot else None
+        challenge = scraped.challenge
+        note = challenge and (
+            f"{challenge.kind} met, {'solved' if challenge.solved else 'not solved'}"
+        )
+    else:
+        # The SDK stops the session on exit and shields that stop from cancellation.
+        async with client.browser(profile_uuid=profile_uuid, **options) as browser:
+            before = await browser.url()
+            nav = browser.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
+            note = await navigate(browser, nav, wait_until, before)
+            if wait_for:
+                await browser.wait_for_selector(wait_for, timeout=timeout)
+            data: dict[str, Any] = {
+                "url": await browser.url(),
+                "status": browser.status,
+                "title": await browser.title(),
+                "raw_html": await browser.content(),
+            }
+            image = (
+                await browser.screenshot(format="jpeg", quality=60)
+                if "screenshot" in wanted
+                else None
+            )
+        built = build(data, text_formats, main_content=only_main_content)
+    header: dict[str, Any] = {"url": built.get("url"), "status": built.get("status")}
     header["note"] = note
-    page: dict[str, Any] = {"title": built["title"]}
+    page: dict[str, Any] = {"title": built.get("title")}
     parts: list[str] = []
     cut: list[str] = []
     for name in ("markdown", "html", "links"):

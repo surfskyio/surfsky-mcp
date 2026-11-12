@@ -5,7 +5,15 @@ description = "MCP server for the Surfsky antidetect cloud browser: scrape, brow
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-keywords = ["surfsky", "mcp", "browser", "automation", "scraping", "antidetect", "agents"]
+keywords = [
+    "surfsky",
+    "mcp",
+    "browser",
+    "automation",
+    "scraping",
+    "antidetect",
+    "agents",
+]
 authors = [{ name = "Surfsky SDK contributors" }]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -17,8 +25,8 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2.2,<3",
-    "surfsky>=0.0.8,<0.1",
-    "surfsky-cli>=0.0.8,<0.1",
+    "surfsky>=0.0.23,<0.1",
+    "surfsky-cli>=0.0.10,<0.1",
     "anyio>=4.4",
 ]
 
