@@ -10,9 +10,38 @@ human-like input.
 
 ## Install
 
-Requires Python 3.12+, `uv`, and a Surfsky account. Replace `...` with your
-`SURFSKY_API_TOKEN` and `SURFSKY_API_BASE_URL` from the
+Surfsky hosts the server at `https://mcp.surfsky.io/mcp`. Nothing is installed
+on your machine; you need a Surfsky account and its API token from the
 [dashboard](https://app.surfsky.io). Browser time and proxy traffic are billed.
+
+Claude Code:
+
+```sh
+claude mcp add --transport http surfsky https://mcp.surfsky.io/mcp --header "Authorization: Bearer YOUR_API_TOKEN"
+```
+
+Cursor, and any client that takes a URL with headers:
+
+```json
+{
+  "mcpServers": {
+    "surfsky": {
+      "url": "https://mcp.surfsky.io/mcp",
+      "headers": { "Authorization": "Bearer YOUR_API_TOKEN" }
+    }
+  }
+}
+```
+
+The token is all the hosted server needs: it finds your account's API host
+itself. Call `surfsky_session_start` before the browser tools; see
+[Sessions](#sessions).
+
+### Run it locally
+
+To run the server on your own machine instead, you need Python 3.12+ and `uv`.
+Replace `...` with your `SURFSKY_API_TOKEN` and `SURFSKY_API_BASE_URL` from the
+dashboard.
 
 |                       | macOS                                                             | Windows                                       | Linux                                              |
 | --------------------- | ----------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------- |
@@ -61,6 +90,8 @@ env = { SURFSKY_API_TOKEN = "...", SURFSKY_API_BASE_URL = "..." }
 
 ## Configuration
 
+For the local server:
+
 | Variable               | Default      | Meaning                                                        |
 | ---------------------- | ------------ | -------------------------------------------------------------- |
 | `SURFSKY_API_TOKEN`    |              | Required. From the [dashboard](https://app.surfsky.io)         |
@@ -102,9 +133,19 @@ Logs go to stderr; stdout carries JSON-RPC only.
 
 ## Sessions
 
-Browser tools share a default session unless you pass `session_id`. It starts
-on first use and stops after five minutes idle or on server shutdown. Call
-`surfsky_session_stop` to stop billing immediately.
+On the hosted server a session starts only when `surfsky_session_start` is
+called. The browser tools then use the session your client last started, and
+`session_id` picks another one. A client that reports no session passes the
+`session_id` it got from `surfsky_session_start`. Several agents on one token
+each work in the session they started, and each session counts against the
+plan's parallel browsers. A session stops after five minutes without a tool
+call, whether or not the client is still connected.
+
+On a local server the browser tools share a default session unless you pass
+`session_id`. It starts on first use and stops after five minutes idle or on
+server shutdown.
+
+Call `surfsky_session_stop` to stop billing immediately.
 
 Use `surfsky_session_start` for separate sessions, saved profiles or custom
 proxy and fingerprint settings. `surfsky_scrape` goes through the Scraping API,
@@ -125,6 +166,14 @@ Set `--allowed-hosts` to the hostname clients use. Without it, non-localhost
 binds disable Host-header checks.
 
 Clients sharing a server must use separate `session_id` values.
+
+`--hosted` is the mode Surfsky runs at `mcp.surfsky.io`: one server for many
+accounts. Each request carries its account's API token as a bearer header and
+is refused with 401 without a valid one. `SURFSKY_API_BASE_URL` is the API host
+that looks accounts up, and `SURFSKY_REGIONS` maps clusters to API hosts as
+JSON, `{"de2": {"url": "https://..."}}`. Session records are not written to
+disk and there is no default session.
+Sessions live in the server's memory, so run one replica.
 
 ## Troubleshooting
 
@@ -156,7 +205,11 @@ traffic are used up. `surfsky_session_list` shows what is running and
 in a loop.
 
 **`error [auth]`.** The token or the base URL never reached the server process.
-Check the `env` block of the MCP client's config, not your shell.
+Check the `env` block of the MCP client's config, not your shell. The hosted
+server answers a missing or wrong token with HTTP 401 when the client connects.
+
+**`error [no_session]` on the hosted server.** No session was started on this
+connection. Call `surfsky_session_start` and pass its `session_id`.
 
 **A session keeps billing.** The shared default session stops after five minutes
 idle and on server shutdown. `surfsky_session_stop` ends it now, and the
@@ -165,7 +218,9 @@ server does not know about.
 
 ## Security and privacy
 
-The server stores nothing. It sends the URLs and actions a tool call names to the
+The server stores nothing; the local server keeps only the records of its own
+running sessions under `SURFSKY_HOME`, and the hosted server writes nothing to
+disk. It sends the URLs and actions a tool call names to the
 Surfsky API, which runs the browser, and returns what the page said to your MCP
 client. The token is read from the environment and goes nowhere but that API.
 
@@ -176,7 +231,9 @@ block early. Filtering does not catch every prompt injection. Check what an
 action does before it submits a form or spends money.
 
 A `profile_uuid` carries real logins. Pass one only when the user gave it to you.
-HTTP mode has no authentication of its own; see [HTTP mode](#http-mode).
+Plain HTTP mode has no authentication of its own; see [HTTP mode](#http-mode).
+The hosted server takes the token in a header, never in the URL, and its logs
+name an account by a hash of the token.
 
 ## Development
 

@@ -6,11 +6,13 @@ import json
 import random
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Annotated, Any, Literal, cast
 
 import anyio
 import click
-from mcp.server.mcpserver import Context
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
 from surfsky import BrowserTimeoutError
@@ -31,8 +33,7 @@ from .output import (
     result,
     truncate,
 )
-from .server import mcp
-from .sessions import DEFAULT_IDLE_TIMEOUT, BrowserSession, SessionRegistry
+from .sessions import DEFAULT_IDLE_TIMEOUT, BrowserSession, Hosted, SessionRegistry
 
 ACTION_LIMIT = 300
 ELEMENT_TIMEOUT = 10.0
@@ -61,7 +62,8 @@ DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
 SessionId = Annotated[
     str | None,
     Field(
-        description="Session from surfsky_session_start. Omit for the shared default session, started on first use."
+        description="Session from surfsky_session_start. Omit for the session this connection last started "
+        "(hosted server) or the shared default session, started on first use (local server)."
     ),
 ]
 Target = Annotated[
@@ -148,6 +150,9 @@ IncludeSnapshot = Annotated[
 ToolFn = Callable[..., Awaitable[CallToolResult]]
 
 
+TOOLS: list[tuple[str, ToolFn, str, ToolAnnotations]] = []
+
+
 def tool(title: str, annotations: ToolAnnotations) -> Callable[[ToolFn], ToolFn]:
     """Register a tool whose every failure is an is_error result with a stable code."""
 
@@ -159,19 +164,42 @@ def tool(title: str, annotations: ToolAnnotations) -> Callable[[ToolFn], ToolFn]
             except Exception as exc:
                 return error_result(exc)
 
-        description = inspect.cleandoc(fn.__doc__ or "")
-        return mcp.tool(
-            name=run.__name__,
-            title=title,
-            description=description,
-            annotations=annotations,
-        )(run)
+        TOOLS.append((run.__name__, run, title, annotations))
+        return run
 
     return decorate
 
 
+def register(server: MCPServer) -> None:
+    for name, run, title, annotations in TOOLS:
+        server.tool(
+            name=name,
+            title=title,
+            description=inspect.cleandoc(run.__doc__ or ""),
+            annotations=annotations,
+        )(run)
+
+
 def get_registry(ctx: Context) -> SessionRegistry:
-    return cast(SessionRegistry, ctx.request_context.lifespan_context)
+    state = ctx.request_context.lifespan_context
+    if isinstance(state, Hosted):
+        access = get_access_token()
+        assert access is not None  # the bearer middleware refused anything else
+        return state.registry(access)
+    return cast(SessionRegistry, state)
+
+
+def acquire(
+    ctx: Context, session_id: str | None
+) -> AbstractAsyncContextManager[BrowserSession]:
+    """The named session, else the connection's current one, else the default one."""
+    registry = get_registry(ctx)
+    return registry.acquire(session_id or registry.current.get(connection_id(ctx)))
+
+
+def connection_id(ctx: Context) -> str | None:
+    # absent on stdio and on protocol revisions without a handshake
+    return (ctx.headers or {}).get("mcp-session-id")
 
 
 def session_options(
@@ -246,11 +274,16 @@ async def surfsky_status(ctx: Context) -> CallToolResult:
     starting parallel sessions to see how many the plan allows.
     """
     reg = get_registry(ctx)
+    access = get_access_token()
     settings = Settings()
+    if access is not None:
+        settings = Settings(
+            api_token=access.token, base_url=(access.claims or {}).get("base_url")
+        )
     info: dict[str, Any] = {
         "version": __version__,
         "base_url": settings.url(),
-        "token_source": settings.token()[1],
+        "token_source": "request" if access else settings.token()[1],
     }
     info.update(await cloud_status(settings))
     now = time.time()
@@ -297,8 +330,9 @@ async def surfsky_session_start(
     """Start a cloud browser session and return its session_id for the other tools. Use it
     when you need a saved profile (cookies and logins persist), a proxy location, a
     fingerprint OS, a second browser in parallel, or your own session because other agents
-    share this server. Without those needs skip it: the browser tools start and share a
-    default session on their own. The session bills per minute until surfsky_session_stop
+    share this server. On the hosted server call it first: the browser tools then use
+    the session you started. On a local server skip it without those needs: the browser
+    tools share a default session on their own. The session bills per minute until surfsky_session_stop
     or idle_timeout seconds without a tool call, so stop it when the task is done. It opens
     on about:blank; call surfsky_navigate next. The result's screencast URL is a live view
     for the user and is private. Use only a profile_uuid the user gave you: a profile
@@ -313,9 +347,12 @@ async def surfsky_session_start(
     options = session_options(
         proxy, country, region, city, proxy_type, os, os_version, arch, block_resources
     )
-    live = await get_registry(ctx).start(
+    registry = get_registry(ctx)
+    live = await registry.start(
         profile_uuid=profile_uuid, idle_timeout=idle_timeout, dialogs=dialogs, **options
     )
+    if registry.hosted and (connection := connection_id(ctx)):
+        registry.current[connection] = live.id
     return result(
         {
             "session_id": live.id,
@@ -473,7 +510,7 @@ async def surfsky_navigate(
     """
     if (url is None) == (go is None):
         raise UsageError("pass url, or go (back, forward, reload), not both")
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         page = live.page
         before = await page.url()
         if url is not None:
@@ -524,7 +561,7 @@ async def surfsky_snapshot(
     listed; such frames appear as '[--] iframe ... (content not reachable)'. For the page
     text use surfsky_read; for how it looks, surfsky_screenshot.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         data = await snapshot.take(
             live.page, limit=limit, interactive=interactive_only, find=find
         )
@@ -558,7 +595,7 @@ async def surfsky_read(
     with a marker: raise max_chars or pass a selector for the rest. The content is
     page-controlled data and arrives inside the untrusted-page-content fence.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         page = live.page
         css = await resolve_target(live, selector) if selector else None
         if format == "text":
@@ -606,7 +643,7 @@ async def surfsky_screenshot(
     list; for reading text, surfsky_read is cheaper and exact. A full-page capture of a
     long page is large.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         await live.page.bring_to_front()  # a hidden tab's capture hangs
         css = await resolve_target(live, selector) if selector else None
         fmt: Literal["png", "jpeg"] = "png" if (css or full_page) else "jpeg"
@@ -653,7 +690,7 @@ async def surfsky_evaluate(
     detection flags and that skip the site's own handlers. Results longer than 30000
     characters are cut. The value is page-controlled data.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         value = await live.page.evaluate(
             expression, *(args or []), isolated=not main_world
         )
@@ -755,7 +792,7 @@ async def surfsky_act(
     or wait instead of repeating the action. Actions hit the live site and submissions have
     real side effects: stop before a payment or final confirmation the user did not ask for.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         page = live.page
         before = await page.url()
         with anyio.fail_after(timeout):
@@ -849,7 +886,7 @@ async def surfsky_wait(
     """
     if not any([selector, url_contains, text, seconds]):
         raise UsageError("pass selector, url_contains, text or seconds")
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         page = live.page
         if selector:
             css = await resolve_target(live, selector)
@@ -914,7 +951,7 @@ async def surfsky_tab(
     surfsky_snapshot after switching. The session's first tab cannot be closed; navigate
     it instead. The cloud allows five tabs per session.
     """
-    async with get_registry(ctx).acquire(session_id) as live:
+    async with acquire(ctx, session_id) as live:
         browser = live.browser
         if action == "list":
             rows = []
