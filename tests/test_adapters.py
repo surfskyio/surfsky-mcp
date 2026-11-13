@@ -11,18 +11,18 @@ pytestmark = pytest.mark.anyio
 
 def test_session_options_speak_the_cli_option_names():
     kwargs = session_options(
-        "premium", "us", None, None, "mobile", "android", "13", "arm", ["image", "font"]
+        "mobile", "us", None, None, "android", "13", "arm", ["image", "font"]
     )
     assert kwargs["proxy"] == PremiumProxy(country="us", type="mobile")
+    residential = session_options("premium", "us", None, None, None, None, None, None)
+    assert residential["proxy"] == PremiumProxy(country="us")
     assert kwargs["fingerprint"] == Fingerprint(
         os="android", os_version="13", os_arch="arm"
     )
     assert kwargs["block_resources"] == frozenset({"image", "font"})
-    assert session_options(None, None, None, None, None, None, None, None, None) == {}
+    assert session_options(None, None, None, None, None, None, None, None) == {}
     with pytest.raises(UsageError, match="drop them when giving a proxy URL"):
-        session_options(
-            "socks5://u:p@h:1", "us", None, None, None, None, None, None, None
-        )
+        session_options("socks5://u:p@h:1", "us", None, None, None, None, None, None)
 
 
 def test_error_result_maps_usage_before_classify():

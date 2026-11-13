@@ -153,7 +153,7 @@ async def test_closed_active_tab_falls_back_to_first_open_page(fakes):
 
 async def test_unknown_session_id(fakes):
     registry = registry_for(fakes)
-    with pytest.raises(NoSession, match="not started by this server"):
+    with pytest.raises(SessionGone, match="not running on this server"):
         async with registry.acquire("nope"):
             pass
 

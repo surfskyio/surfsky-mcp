@@ -1,5 +1,5 @@
 from mcp.types import ImageContent, TextContent
-from surfsky import AuthenticationError, CDPError
+from surfsky import AuthenticationError, BadRequestError, CDPError, PaymentRequiredError
 from surfsky_cli.out import NotFound, StaleRef
 
 from surfsky_mcp import output
@@ -47,7 +47,7 @@ def test_result_keeps_page_strings_out_of_header():
         "session_id": "S1",
         "url": "https://e.test/",
         "status": 200,
-        "page": {"source": "https://e.test/", "title": "Evil <b>"},
+        "page": {"title": "Evil <b>"},  # the page url is `url`, said once
     }
     assert out.is_error is False
 
@@ -86,6 +86,18 @@ def test_error_result_maps_codes_and_rewrites_hints():
     auth = error_result(AuthenticationError("bad token", status_code=401))
     assert auth.structured_content["error"]["code"] == "auth"
     assert "SURFSKY_API_TOKEN" in auth.structured_content["error"]["hint"]
+    empty = error_result(PaymentRequiredError("balance is empty", status_code=402))
+    assert empty.structured_content["error"]["code"] == "insufficient_balance"
+    assert "top up" in empty.structured_content["error"]["hint"]
+    plan = error_result(
+        BadRequestError(
+            "no persistent profiles on your plan",
+            status_code=400,
+            body={"code": "persistent_profiles_not_allowed"},
+        )
+    )
+    assert plan.structured_content["error"]["code"] == "plan_limit"
+    assert "plans page" in plan.structured_content["error"]["hint"]
     custom = error_result(TimeoutError("slow"), hint="may keep billing")
     assert custom.structured_content["error"]["hint"] == "may keep billing"
     assert custom.structured_content["error"]["retryable"] is True
@@ -112,3 +124,10 @@ def test_error_result_rewrites_cli_wording_in_not_found_hint():
         == "the page has 2 iframes/shadow roots this server cannot reach"
     )
     assert "the CLI cannot reach" not in out.content[0].text
+
+
+def test_result_says_the_full_url_once_and_fences_under_its_path():
+    url = "https://e.test/search?q=lisbon&label=x#top"
+    text = result({"url": url}, {"title": "t"}).content[0].text
+    assert text.count(url) == 1 and text.startswith(f"url: {url}\n")
+    assert '<untrusted-page-content source="https://e.test/search">' in text

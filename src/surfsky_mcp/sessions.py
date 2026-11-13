@@ -36,6 +36,7 @@ class BrowserSession(Attached):
 
     lock: anyio.Lock = field(default_factory=anyio.Lock)
     default: bool = False
+    owner: str | None = None
     last_used: float = field(default_factory=time.time)
     snapshot_hash: str | None = None
     stop_failed: bool = False
@@ -71,10 +72,17 @@ class SessionRegistry:
             self._client = self._factory()
         return self._client
 
+    def current_for(self, connection: str | None) -> str | None:
+        if connection:
+            return self.current.get(connection)
+        unowned = [live.id for live in self.sessions.values() if live.owner is None]
+        return unowned[0] if self.hosted and len(unowned) == 1 else None
+
     async def start(
         self,
         *,
         default: bool = False,
+        owner: str | None = None,
         profile_uuid: str | None = None,
         idle_timeout: int | None = None,
         dialogs: str = "dismiss",
@@ -89,9 +97,16 @@ class SessionRegistry:
             **options,
         )
         live = BrowserSession(
-            record, {"last_used": time.time()}, None, None, default=default
+            record,
+            {"last_used": time.time()},
+            None,
+            None,
+            default=default,
+            owner=owner,
         )
         self.sessions[live.id] = live
+        if owner:
+            self.current[owner] = live.id
         try:
             async with live.lock:
                 await self._connect(live)
@@ -118,7 +133,7 @@ class SessionRegistry:
     async def acquire(self, session_id: str | None) -> AsyncIterator[BrowserSession]:
         if session_id is None and self.hosted:
             raise NoSession(
-                "no session: call surfsky_session_start, then pass its session_id"
+                "no current session: pass session_id, or call surfsky_session_start first"
             )
         live = (
             await self._default_session()
@@ -134,7 +149,9 @@ class SessionRegistry:
     def _lookup(self, session_id: str) -> BrowserSession:
         live = self.sessions.get(session_id)
         if live is None:
-            raise NoSession(f"session {session_id} was not started by this server")
+            raise SessionGone(
+                f"session {session_id} is not running on this server: stopped, idle timeout, or a restart"
+            )
         return live
 
     async def _default_session(self) -> BrowserSession:
@@ -285,12 +302,12 @@ class Hosted:
             token=token,
             client_id=hashlib.sha256(token.encode()).hexdigest()[:12],
             scopes=[],
-            claims={"base_url": base_url, "cluster": region.cluster},
+            claims={"base_url": base_url, "cluster": region.cluster, "api_token": token},
         )
 
     def registry(self, access: AccessToken) -> SessionRegistry:
         claims = access.claims or {}
-        token, base_url = access.token, claims.get("base_url")
+        token, base_url = claims["api_token"], claims.get("base_url")
         if not base_url and claims.get("cluster"):
             raise Hinted(f"this server does not serve cluster {claims['cluster']}")
         if not base_url:
@@ -302,7 +319,7 @@ class Hosted:
         if registry is None:
             registry = self.registries[token, base_url] = SessionRegistry(
                 lambda: self._factory(api_token=token, base_url=base_url),
-                account=access.client_id,
+                account=hashlib.sha256(token.encode()).hexdigest()[:12],
             )
         registry.last_used = time.time()
         return registry

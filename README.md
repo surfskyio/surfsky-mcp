@@ -3,24 +3,33 @@
 [![PyPI](https://img.shields.io/pypi/v/surfsky-mcp)](https://pypi.org/project/surfsky-mcp/)
 [![CI](https://github.com/surfskyio/surfsky-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/surfskyio/surfsky-mcp/actions/workflows/ci.yml)
 
-Chrome in the cloud for Claude, Cursor or any MCP client. Read pages a plain HTTP
-fetch cannot, then click through them, fill forms and take screenshots. Runs on
-[Surfsky](https://surfsky.io), an antidetect browser with residential proxies and
-human-like input.
+MCP server for the [Surfsky](https://surfsky.io) cloud browser: an agent reads a
+URL in one call, or controls a session (navigate, click, type, screenshot) in an
+antidetect Chrome behind residential proxies.
 
-## Install
+## Connect
 
-Surfsky hosts the server at `https://mcp.surfsky.io/mcp`. Nothing is installed
-on your machine; you need a Surfsky account and its API token from the
-[dashboard](https://app.surfsky.io). Browser time and proxy traffic are billed.
+Surfsky hosts the server at `https://mcp.surfsky.io/mcp`. You need a Surfsky
+account. Browser time, scrapes and proxy traffic are billed.
 
-Claude Code:
+Claude Code, OAuth login:
+
+```sh
+claude mcp add --transport http surfsky https://mcp.surfsky.io/mcp
+claude mcp login surfsky
+```
+
+The login opens app.surfsky.io to sign in and allow access. Any other client
+with OAuth support takes the URL alone. Revoke access under Connected apps in the
+[dashboard](https://app.surfsky.io).
+
+Claude Code, API token from the dashboard:
 
 ```sh
 claude mcp add --transport http surfsky https://mcp.surfsky.io/mcp --header "Authorization: Bearer YOUR_API_TOKEN"
 ```
 
-Cursor, and any client that takes a URL with headers:
+Cursor and other clients that take a URL with headers:
 
 ```json
 {
@@ -33,23 +42,21 @@ Cursor, and any client that takes a URL with headers:
 }
 ```
 
-The token is all the hosted server needs: it finds your account's API host
-itself. Call `surfsky_session_start` before the browser tools; see
-[Sessions](#sessions).
+The hosted server finds your account's API host itself. Browser tools need
+`surfsky_session_start` first; see [Sessions](#sessions).
 
-### Run it locally
+## Run locally
 
-To run the server on your own machine instead, you need Python 3.12+ and `uv`.
-Replace `...` with your `SURFSKY_API_TOKEN` and `SURFSKY_API_BASE_URL` from the
-dashboard.
+Needs [`uv`](https://docs.astral.sh/uv/), which downloads Python 3.12+ itself.
 
-|                       | macOS                                                             | Windows                                       | Linux                                              |
-| --------------------- | ----------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------- |
-| Install `uv`          | `brew install uv`                                                 | `winget install astral-sh.uv`                 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| Claude Desktop config | `~/Library/Application Support/Claude/claude_desktop_config.json` | `%APPDATA%\Claude\claude_desktop_config.json` | no Desktop build; use Claude Code                  |
-| Claude Desktop logs   | `~/Library/Logs/Claude/`                                          | `%APPDATA%\Claude\logs\`                      |                                                    |
+| Variable               | Default      | Meaning                                      |
+| ---------------------- | ------------ | -------------------------------------------- |
+| `SURFSKY_API_TOKEN`    |              | Required. From the dashboard                 |
+| `SURFSKY_API_BASE_URL` |              | Required. Your account's API host, same page |
+| `SURFSKY_HOME`         | `~/.surfsky` | Where session records are written            |
 
-`uv` downloads Python itself, so no separate Python install is needed.
+Set them in the MCP client's config; the server does not see your shell profile.
+Logs go to stderr.
 
 Claude Code:
 
@@ -57,7 +64,7 @@ Claude Code:
 claude mcp add surfsky -e SURFSKY_API_TOKEN=... -e SURFSKY_API_BASE_URL=... -- uvx surfsky-mcp
 ```
 
-Claude Desktop / Cursor:
+Claude Desktop and Cursor:
 
 ```json
 {
@@ -71,15 +78,7 @@ Claude Desktop / Cursor:
 }
 ```
 
-On macOS the app does not read your shell profile, so `"command": "uvx"` fails
-to start. Use the absolute path that `which uvx` prints. Windows finds `uvx` on
-PATH.
-
-After changing the config, quit Claude Desktop with Cmd+Q on macOS or from the
-tray on Windows, then start it again. Closing the window leaves the old server
-process running.
-
-Codex (`~/.codex/config.toml`):
+Codex, `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.surfsky]
@@ -88,71 +87,100 @@ args = ["surfsky-mcp"]
 env = { SURFSKY_API_TOKEN = "...", SURFSKY_API_BASE_URL = "..." }
 ```
 
-## Configuration
+Claude Desktop:
 
-For the local server:
-
-| Variable               | Default      | Meaning                                                        |
-| ---------------------- | ------------ | -------------------------------------------------------------- |
-| `SURFSKY_API_TOKEN`    |              | Required. From the [dashboard](https://app.surfsky.io)         |
-| `SURFSKY_API_BASE_URL` |              | Required. The API host for your account, also on the dashboard |
-| `SURFSKY_HOME`         | `~/.surfsky` | Where session state files are written                          |
-
-Set them in the MCP client's config, not in your shell.
-
-Logs go to stderr; stdout carries JSON-RPC only.
-
-## What you can ask
-
-| Ask                                                      | What happens                                                                                                                                                       |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| "Read this page and summarize the reviews."              | One `surfsky_scrape` through the Scraping API. No session                                                                                                          |
-| "Compare this product's price across these three shops." | Three scrapes. A shop that needs a click to show the price gets a session                                                                                          |
-| "Fill this form with the details from my notes."         | `surfsky_snapshot` for `@N` references, then `surfsky_act`. The server tells the model to stop short of a payment or a final confirmation unless you asked for one |
-| "Sign in and check last month's invoice."                | `surfsky_session_start` with a `profile_uuid` you supply; the saved profile carries the login                                                                      |
-| "Screenshot the top of this article."                    | `surfsky_screenshot`, or `surfsky_scrape` with `formats: ["screenshot"]`                                                                                           |
-| "Which of my browsers are still running?"                | `surfsky_session_list`, then `surfsky_session_stop` for the ones you are done with                                                                                 |
+- Config: `~/Library/Application Support/Claude/claude_desktop_config.json` on
+  macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows. Logs:
+  `~/Library/Logs/Claude/` and `%APPDATA%\Claude\logs\`.
+- On macOS the app has no shell PATH, so `"command": "uvx"` fails to start. Use
+  the absolute path from `which uvx`.
+- After a config change quit the app (Cmd+Q, or the tray on Windows). Closing
+  the window leaves the old server process running.
 
 ## Tools
 
-| Tool                    | Description                                                           |
-| ----------------------- | --------------------------------------------------------------------- |
-| `surfsky_scrape`        | Fetch a URL as Markdown, HTML, links or a screenshot.                 |
-| `surfsky_navigate`      | Open a URL, go back or forward, or reload.                            |
-| `surfsky_snapshot`      | List page elements with `@N` references for actions.                  |
-| `surfsky_act`           | Click, double-click, hover, fill, type, press keys, select or scroll. |
-| `surfsky_wait`          | Wait for an element, URL, text or a delay.                            |
-| `surfsky_read`          | Read page content as Markdown, text, HTML or links.                   |
-| `surfsky_screenshot`    | Capture the viewport, full page or an element.                        |
-| `surfsky_evaluate`      | Run JavaScript in an isolated context or the page context.            |
-| `surfsky_tab`           | List, open, switch or close tabs.                                     |
-| `surfsky_session_start` | Start a session with profile, proxy or fingerprint settings.          |
-| `surfsky_session_stop`  | Stop a session and its billing. Safe to repeat.                       |
-| `surfsky_session_list`  | List the account's running sessions.                                  |
-| `surfsky_status`        | Check credentials, plan limits and proxy quota.                       |
+| Tool                    | Does                                                                |
+| ----------------------- | ------------------------------------------------------------------- |
+| `surfsky_scrape`        | Fetch a URL as markdown, html, links or a screenshot. No session    |
+| `surfsky_session_start` | Start a session: saved profile, proxy, location, fingerprint OS     |
+| `surfsky_session_stop`  | Stop any session on the account and its billing. Safe to repeat     |
+| `surfsky_session_list`  | List the account's running sessions                                 |
+| `surfsky_navigate`      | Open a URL, go back or forward, or reload                           |
+| `surfsky_snapshot`      | List visible interactive elements and headings as `@N` refs         |
+| `surfsky_act`           | click, dblclick, hover, fill, type, press, select, scroll           |
+| `surfsky_wait`          | Wait for an element, a URL substring, page text or a fixed delay    |
+| `surfsky_read`          | Read the tab as markdown, text, html or links                       |
+| `surfsky_screenshot`    | Viewport as JPEG; full page or one element as PNG                   |
+| `surfsky_evaluate`      | Run JavaScript, in an isolated world unless `main_world` is set     |
+| `surfsky_tab`           | List, open, switch or close tabs                                    |
+| `surfsky_status`        | Credentials, plan limits, proxy quota, sessions this server owns    |
+
+Targets are a CSS selector, `@N` from a snapshot of the same tab and URL, or
+`text=words`. No XPath. Iframe and shadow-root contents are not in the snapshot.
+
+`surfsky_act` with `steps` runs up to 20 actions in one call, within 45 seconds.
+The first failing step stops the run; the error names it and carries the page
+state.
+
+`surfsky_scrape` goes through the Scraping API, which serves the page from a
+pre-started browser. With `profile_uuid`, `proxy`, `country`, `region`, `city`
+or `os` it starts a browser of its own for the call and stops it after.
 
 ## Sessions
 
-On the hosted server a session starts only when `surfsky_session_start` is
-called. The browser tools then use the session your client last started, and
-`session_id` picks another one. A client that reports no session passes the
-`session_id` it got from `surfsky_session_start`. Several agents on one token
-each work in the session they started, and each session counts against the
-plan's parallel browsers. A session stops after five minutes without a tool
-call, whether or not the client is still connected.
+A session bills per minute until `surfsky_session_stop` or its idle timeout: 300
+seconds without a tool call by default, `idle_timeout` on start sets 1 to 3600.
+Each one counts against the plan's parallel browsers. The server stops its
+sessions on shutdown.
 
-On a local server the browser tools share a default session unless you pass
-`session_id`. It starts on first use and stops after five minutes idle or on
-server shutdown.
+Local server: browser tools without `session_id` share a default session that
+starts on first use. Start your own for a saved profile, a proxy location, a
+fingerprint OS or a second browser.
 
-Call `surfsky_session_stop` to stop billing immediately.
+Hosted server: there is no default session. Browser tools use the session your
+client last started, and `session_id` picks another. A client that keeps no
+connection between calls gets the account's only running session and must pass
+`session_id` when several run.
 
-Use `surfsky_session_start` for separate sessions, saved profiles or custom
-proxy and fingerprint settings. `surfsky_scrape` goes through the Scraping API,
-which serves the page from a pre-started browser; given a `profile_uuid`, a proxy
-or an `os`, it starts a browser of its own and stops it when done.
-Sessions can also be listed and stopped through the
-[Surfsky CLI](https://github.com/surfskyio/surfsky-cli).
+`surfsky_session_start` returns a `live_url` to watch the browser and take over
+for a login, a 2FA code or a captcha. Anyone with the URL controls the browser.
+
+A `profile_uuid` loads a saved profile; its cookies and logins are saved back on
+a normal stop. It cannot be combined with `os`, `os_version` or `arch`.
+
+The [Surfsky CLI](https://github.com/surfskyio/surfsky-cli) also lists and stops
+sessions, including ones this server did not start.
+
+## Bot challenges
+
+`surfsky_scrape` passes most challenge pages itself and each call gets a
+different proxy exit, so a retry often gets through.
+
+`surfsky_navigate` makes at most one solve of a challenge page's own widget,
+billed as a captcha solve where the account pays for solving. The result's `note`
+reads `challenge_page met, solved`, `passed` (the page let the browser through
+without a solve) or `not solved`, with the price when one was charged. It never
+solves a captcha on an ordinary page.
+
+A 200 with a short page, or one asking to prove you are human, is still a
+challenge. If a site blocks every fresh browser, use a session with a saved
+`profile_uuid`.
+
+## Limits
+
+| What                                             | Limit                                         |
+| ------------------------------------------------ | --------------------------------------------- |
+| Text from `surfsky_scrape` and `surfsky_read`    | 10,000 chars; `max_chars` up to 200,000       |
+| `surfsky_evaluate` result                        | 30,000 chars                                  |
+| `surfsky_snapshot` rows                          | 500; `limit` raises it, `find` narrows        |
+| Snapshot in `surfsky_navigate` and `surfsky_act` | first 80 rows                                 |
+| `surfsky_read` with `selector` and `limit`       | 100 elements                                  |
+| `surfsky_act` `steps`                            | 20 actions, 45 s per call                     |
+| `surfsky_act` `timeout`, per action              | 10 s, at most 30                              |
+| `timeout` of navigate, scrape and wait           | 30 s by default                               |
+| Tabs per session                                 | 5                                             |
+
+Cut text ends with a `[truncated: ...]` marker.
 
 ## HTTP mode
 
@@ -160,80 +188,63 @@ Sessions can also be listed and stopped through the
 uvx surfsky-mcp --http --host 0.0.0.0 --port 8000 --allowed-hosts mcp.example.com
 ```
 
-Serves streamable HTTP at `/mcp`. Set the same credentials in the environment.
-There is no built-in authentication; use an authenticated proxy or private network.
-Set `--allowed-hosts` to the hostname clients use. Without it, non-localhost
-binds disable Host-header checks.
+Serves streamable HTTP at `/mcp` for one account, with the same environment
+variables as stdio. Defaults are `127.0.0.1:8000`. There is no authentication:
+put it behind an authenticating proxy or a private network. `--allowed-hosts` is
+a comma-separated list of Host header values clients use; without it a
+non-localhost bind turns Host header checks off. Clients sharing the server
+should each start their own session.
 
-Clients sharing a server must use separate `session_id` values.
+### Hosted mode
 
-`--hosted` is the mode Surfsky runs at `mcp.surfsky.io`: one server for many
-accounts. Each request carries its account's API token as a bearer header and
-is refused with 401 without a valid one. `SURFSKY_API_BASE_URL` is the API host
-that looks accounts up, and `SURFSKY_REGIONS` maps clusters to API hosts as
-JSON, `{"de2": {"url": "https://..."}}`. Session records are not written to
-disk and there is no default session.
-Sessions live in the server's memory, so run one replica.
+`--hosted` is what runs at `mcp.surfsky.io`: one server for many accounts. Each
+request carries an API token as a bearer and gets 401 without a valid one.
+Sessions and tokens live in memory, so run one replica.
+
+| Variable                      | Meaning                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `SURFSKY_API_BASE_URL`        | Required. API host that looks accounts up                            |
+| `SURFSKY_REGIONS`             | Clusters to API hosts, as JSON: `{"de2": {"url": "https://..."}}`    |
+| `SURFSKY_OAUTH`               | Set to `1` to add OAuth login; needs the four variables below        |
+| `SURFSKY_MCP_URL`             | Public URL of this server without `/mcp`, HTTPS unless localhost     |
+| `SURFSKY_CONSENT_URL`         | Consent page users are sent to                                       |
+| `SURFSKY_WEB_APP_URL`         | Dashboard API that stores OAuth clients and connected apps           |
+| `SURFSKY_MCP_INTERNAL_SECRET` | Bearer secret for that API                                           |
+
+With OAuth on, API tokens in the header still work. Access tokens last an hour.
+The dashboard keeps refresh tokens, so after a restart clients get a new access
+token without signing in again.
 
 ## Troubleshooting
 
-**A page returns 200 but the text is short, or asks you to continue shopping or
-prove you are human.** That is a bot challenge, not a bug. The Scraping API
-passes most of them itself and each scrape gets a different proxy exit, so a
-retry often gets through. If a
-site blocks every fresh browser, start a session with a saved `profile_uuid`,
-whose cookies survive between runs.
+Errors come back as `error [code]: message` with a hint.
 
-**The result carries `note: navigation did not reach 'load'`.** The document
-parsed, but a request stayed open past the timeout. The content and the status
-are there; anything that loads late may be missing. Pass
-`wait_until: "domcontentloaded"` and a `wait_for` selector for the element you
-need.
+| Code or note                           | Cause and fix                                                                                             |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `auth`                                 | Token or base URL did not reach the server process: check the `env` block of the client config. The hosted server answers a bad token with HTTP 401 at connect |
+| `no_session`                           | Hosted: nothing is running, or several are and the call named none. Call `surfsky_session_start` or pass `session_id` |
+| `session_gone`                         | The session stopped, idled out, or the server restarted. Start another; page state is lost                |
+| `stale_ref`                            | The page changed under the `@N` refs. Call `surfsky_snapshot` and pick the target again                   |
+| `timeout`                              | Nothing arrived in time. Retry with a longer `timeout`, or `wait_until: "domcontentloaded"` or `"commit"`                          |
+| `plan_full`, `quota`                   | Parallel sessions or traffic are used up. `surfsky_session_list` and `surfsky_session_stop` free a slot; `surfsky_status` shows the limits. Do not retry in a loop |
+| `insufficient_balance`, `plan_limit`   | Top up, or change the plan, in the dashboard                                                              |
+| `note: navigation did not reach 'load'` | A request stayed open past the timeout. Status and content are there, late content may be missing. Use `wait_until: "domcontentloaded"` and `surfsky_wait` (`wait_for` in `surfsky_scrape`) for the element you need |
 
-**`error [timeout]`.** The navigation committed no document at all. Retry with a
-longer `timeout`, or `wait_until: "commit"` to stop at the first response.
+## Security
 
-**`error [stale_ref]`.** The page moved under the `@N` references. Call
-`surfsky_snapshot` and pick the target again.
+Tool calls go to the Surfsky API, which runs the browser, and nowhere else. The
+local server writes only the records of its running sessions under
+`SURFSKY_HOME`; the hosted server writes nothing to disk, takes the token in a
+header and logs accounts by a hash of it.
 
-**`error [session_gone]`.** The cloud no longer has that session. Start another;
-page state is lost.
+Page content, snapshots, screenshots and JavaScript results are untrusted. Text
+arrives inside an `<untrusted-page-content>` block with invisible and
+bidirectional characters stripped, and a page cannot close the block early. That
+does not stop every prompt injection: check what an action does before it
+submits a form or spends money. The server's instructions tell the model to stop
+before a payment or final confirmation the user did not ask for.
 
-**`error [plan_full]` or `error [quota]`.** The plan's parallel sessions or its
-traffic are used up. `surfsky_session_list` shows what is running and
-`surfsky_session_stop` frees one. `surfsky_status` shows the limits. Do not retry
-in a loop.
-
-**`error [auth]`.** The token or the base URL never reached the server process.
-Check the `env` block of the MCP client's config, not your shell. The hosted
-server answers a missing or wrong token with HTTP 401 when the client connects.
-
-**`error [no_session]` on the hosted server.** No session was started on this
-connection. Call `surfsky_session_start` and pass its `session_id`.
-
-**A session keeps billing.** The shared default session stops after five minutes
-idle and on server shutdown. `surfsky_session_stop` ends it now, and the
-[Surfsky CLI](https://github.com/surfskyio/surfsky-cli) can stop sessions this
-server does not know about.
-
-## Security and privacy
-
-The server stores nothing; the local server keeps only the records of its own
-running sessions under `SURFSKY_HOME`, and the hosted server writes nothing to
-disk. It sends the URLs and actions a tool call names to the
-Surfsky API, which runs the browser, and returns what the page said to your MCP
-client. The token is read from the environment and goes nowhere but that API.
-
-Page content, snapshots, screenshots and JavaScript results arrive inside an
-`<untrusted-page-content>` block introduced as data rather than instructions.
-Invisible and bidirectional characters are stripped, and a page cannot close the
-block early. Filtering does not catch every prompt injection. Check what an
-action does before it submits a form or spends money.
-
-A `profile_uuid` carries real logins. Pass one only when the user gave it to you.
-Plain HTTP mode has no authentication of its own; see [HTTP mode](#http-mode).
-The hosted server takes the token in a header, never in the URL, and its logs
-name an account by a hash of the token.
+A `profile_uuid` carries real logins. Pass one only when the user gave it.
 
 ## Development
 

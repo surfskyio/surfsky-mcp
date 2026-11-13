@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 from mcp.client import Client
@@ -33,18 +34,15 @@ async def test_live_round_trip():
                 "surfsky_navigate",
                 {"url": "https://example.com", "session_id": session_id},
             )
-            assert nav.structured_content["status"] == 200
-            refs = [
-                row
-                for row in nav.structured_content["page"]["snapshot"]
-                if row["role"] == "link"
-            ]
+            text = nav.content[0].text
+            assert "status: 200" in text
+            refs = re.findall(r"^\[(@\d+)\] link ", text, re.MULTILINE)
             assert refs, "example.com has one link"
             acted = await client.call_tool(
                 "surfsky_act",
                 {
                     "action": "click",
-                    "target": f"@{refs[0]['ref']}",
+                    "target": refs[0],
                     "session_id": session_id,
                 },
             )

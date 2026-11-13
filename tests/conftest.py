@@ -48,6 +48,16 @@ class Recorder:
         return [call for call in self.calls if call[0] == name]
 
 
+class FakeKeyboard(Recorder):
+    def __init__(self, page):
+        super().__init__()
+        self._page = page
+
+    async def type(self, text):
+        self.calls.append(("type", (text,), {}))
+        self._page.typed(text)
+
+
 class FakePage(Recorder):
     def __init__(self, target_id="T1", url="about:blank", title=""):
         super().__init__()
@@ -60,9 +70,18 @@ class FakePage(Recorder):
         self.evaluate_result = "ok"
         self.counts = {}
         self.after_click_url = None
-        self.keyboard = Recorder()
+        self.keyboard = FakeKeyboard(self)
         self.mouse = Recorder()
         self.fill_gate = None
+        # the element typing goes to: None when the page gives no value to compare
+        self.field = {"editable": True, "value": "", "focused": True}
+        self.stolen = 0  # typing attempts the page moves focus away from
+        self.unfocused = 0  # clicks that leave the field without focus
+        self.challenge = None  # what Captcha.detect reports as challenge_page
+        self.widget = True  # the challenge page shows a widget to solve
+        self.self_passing = 0  # detects after which the challenge page passes by itself
+        self.solve_error = None
+        self.check_error = None  # raised by the read of the field after typing
 
     async def url(self):
         return self._url
@@ -89,15 +108,40 @@ class FakePage(Recorder):
         if self.after_click_url:
             self._url = self.after_click_url
 
+    def typed(self, text, replace=False):
+        if self.field is None or self.field["value"] is None:
+            return
+        if self.stolen:
+            self.stolen -= 1
+            self.field["focused"] = False
+            return
+        self.field["focused"] = True
+        self.field["value"] = text if replace else self.field["value"] + text
+
     async def fill(self, selector, text):
         if self.fill_gate is not None:
             await self.fill_gate.wait()
         self.calls.append(("fill", (selector, text), {}))
+        if self.unfocused:
+            self.unfocused -= 1
+            raise ValueError(f"{selector!r} did not take focus")
+        self.typed(text, replace=True)
+
+    async def type(self, selector, text):
+        self.calls.append(("type", (selector, text), {}))
+        if self.unfocused:
+            self.unfocused -= 1
+            raise ValueError(f"{selector!r} did not take focus")
+        self.typed(text)
 
     async def evaluate(self, expression, *args, **kwargs):
         self.calls.append(("evaluate", (expression, *args), kwargs))
         if expression.startswith("(limit, interactive, find)"):
             return self.walk
+        if expression.startswith("(selector, mark)"):
+            if self.check_error and not args[1]:
+                raise self.check_error
+            return self.field and dict(self.field)
         return self.evaluate_result
 
     async def screenshot(self, **kwargs):
@@ -126,6 +170,27 @@ class FakePage(Recorder):
 
     async def send(self, method, params=None):
         self.calls.append(("send", (method, params), {}))
+        if method == "Captcha.detect":
+            if self.challenge and self.self_passing:
+                self.self_passing -= 1
+                if not self.self_passing:
+                    self.status, self.challenge = 200, None
+            widget = bool(self.challenge and self.widget)
+            return {
+                "detected": widget,
+                "captcha_type": "turnstile" if widget else None,
+                "selector": "#cf-widget" if widget else None,
+                "challenge_page": self.challenge,
+            }
+        if method == "Captcha.solve":
+            if self.solve_error is not None:
+                raise self.solve_error
+            self.status, self.challenge = 200, None
+            return {
+                "status": "success",
+                "type": "turnstile",
+                "usage": {"cost_usd": 0.0012},
+            }
         if method == "Page.getLayoutMetrics":
             return {"cssVisualViewport": {"clientHeight": 1000}}
         return {}
@@ -298,6 +363,13 @@ async def client(fakes, monkeypatch):
 
 def text_of(result):
     return result.content[0].text
+
+
+def header_of(result):
+    """The `key: value` lines above the fence, for a result that is text only."""
+    assert result.structured_content is None
+    head = text_of(result).split("\n\n")[0]
+    return dict(line.split(": ", 1) for line in head.splitlines())
 
 
 def error_of(result):

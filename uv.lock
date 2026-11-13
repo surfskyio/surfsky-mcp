@@ -777,7 +777,7 @@ wheels = [
 
 [[package]]
 name = "surfsky-cli"
-version = "0.0.11"
+version = "0.0.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -787,9 +787,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "surfsky" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d5/2c/fffdc7d72c283e9f8a41c9516f0ce2edeb8419d78c4ed904a3401fc8d8fb/surfsky_cli-0.0.11.tar.gz", hash = "sha256:b321c1a05ba9c7e3e725344220860a597fd9ecd102a5d57f842b1e4f00f72f58", size = 54845, upload-time = "2026-11-12T13:52:55.342Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/ed/9173ad27ec5937eb4bd13633883bdb4a49833b4a941dcf530a4bcc96699a/surfsky_cli-0.0.12.tar.gz", hash = "sha256:08fd19af89660434a7deb263646870c7dfd05f9faf0e1d2971dd0f41d664bab9", size = 55988, upload-time = "2026-11-13T15:27:05.924Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/10/b4/31785f20384542b0e72b4e103479fcbc31503ccd4393047be1eb179d16e5/surfsky_cli-0.0.11-py3-none-any.whl", hash = "sha256:58ed8ce2a00a604ba6cb7ba885e9a313b4b4597fae2a8b2b6440f19e04ba7b48", size = 44167, upload-time = "2026-11-12T13:52:54.287Z" },
+    { url = "https://files.pythonhosted.org/packages/db/e4/ec0f61b9f418806e77d8da2009b79a47a7e4ac3b87748cb6e5fb419f4b35/surfsky_cli-0.0.12-py3-none-any.whl", hash = "sha256:0938f422a118ebf92cb804f692862a16d8c1c262b9953926747b841554820cd6", size = 44631, upload-time = "2026-11-13T15:27:04.996Z" },
 ]
 
 [[package]]
@@ -798,6 +798,7 @@ version = "0.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "httpx2" },
     { name = "mcp" },
     { name = "surfsky" },
     { name = "surfsky-cli" },
@@ -805,7 +806,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
@@ -814,14 +814,14 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.4" },
+    { name = "httpx2", specifier = ">=2.5" },
     { name = "mcp", specifier = ">=2.2,<3" },
     { name = "surfsky", specifier = ">=0.0.24,<0.1" },
-    { name = "surfsky-cli", specifier = ">=0.0.11,<0.1" },
+    { name = "surfsky-cli", specifier = ">=0.0.12,<0.1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = ">=2.5" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "ty", specifier = ">=0.0.56" },

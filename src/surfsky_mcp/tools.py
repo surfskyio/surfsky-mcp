@@ -5,24 +5,26 @@ import inspect
 import json
 import random
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, suppress
 from typing import Annotated, Any, Literal, cast
 
 import anyio
 import click
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.types import CallToolResult, ToolAnnotations
-from pydantic import Field
-from surfsky import BrowserTimeoutError
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field
+from surfsky import BrowserTimeoutError, SurfskyError
 from surfsky.types import ScreenshotOptions
 from surfsky_cli import html, snapshot
 from surfsky_cli import session as cli
 from surfsky_cli.commands.scrape import build, with_scheme
 from surfsky_cli.commands.status import cloud_status
 from surfsky_cli.config import Settings
-from surfsky_cli.out import NotFound, render
+from surfsky_cli.out import NotFound, StaleRef, render
+from surfsky_cli.snapshot import wait_for_load
 
 from . import __version__
 from .output import (
@@ -35,9 +37,24 @@ from .output import (
 )
 from .sessions import DEFAULT_IDLE_TIMEOUT, BrowserSession, Hosted, SessionRegistry
 
-ACTION_LIMIT = 300
+ACTION_LIMIT = 80
+EVALUATE_MAX_CHARS = 30_000
+MAX_STEPS = 20
+STEPS_TIMEOUT = 45.0
+TEXT_WAIT = 3.0
+REF_CHECK_LIMIT = 10_000
 ELEMENT_TIMEOUT = 10.0
+MAX_ELEMENT_TIMEOUT = 30.0
 NAV_TIMEOUT = 30.0
+CHALLENGE_STATUS = (401, 403, 429)
+NAVIGATE_BUDGET = 50.0
+DETECT_TIMEOUT = 5.0
+WIDGET_WAIT = 15.0
+WIDGET_POLL = 1.0
+MIN_SOLVE = 15.0
+SOLVE_RESERVE = 8.0
+CHALLENGE_RELOAD = 3.0
+REFOCUS_WAIT = 0.5
 
 READ_ONLY = ToolAnnotations(
     read_only_hint=True,
@@ -45,9 +62,9 @@ READ_ONLY = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=True,
 )
-DESTRUCTIVE = ToolAnnotations(
+ACTING = ToolAnnotations(
     read_only_hint=False,
-    destructive_hint=True,
+    destructive_hint=False,
     idempotent_hint=False,
     open_world_hint=True,
 )
@@ -61,32 +78,28 @@ DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
 
 SessionId = Annotated[
     str | None,
-    Field(
-        description="Session from surfsky_session_start. Omit for the session this connection last started "
-        "(hosted server) or the shared default session, started on first use (local server)."
-    ),
+    Field(description="Session from surfsky_session_start; omit for the current one."),
 ]
 Target = Annotated[
     str | None,
     Field(
-        description="A CSS selector, @N from the latest snapshot of this tab, or text=words (the first visible "
-        "element whose name contains the words). XPath is not accepted."
+        description="CSS selector, @N from a snapshot of this page, or text=words (the first visible "
+        "element whose name contains the words). No XPath."
     ),
 ]
 ProfileUuid = Annotated[
     str | None,
     Field(
-        description="Saved Surfsky profile to load: its cookies and logins come with it and are saved back on a "
-        "normal stop. Only a uuid the user gave you. Not combinable with os, os_version or arch: the profile owns "
-        "its fingerprint."
+        description="Saved profile to load: its cookies and logins come with it and are saved back on a "
+        "normal stop. Only a uuid the user gave you. Not with os, os_version or arch."
     ),
 ]
 Proxy = Annotated[
     str | None,
     Field(
-        description="Omit for the account default. 'premium': the residential pool (proxy_type 'mobile' for mobile "
-        "IPs). 'shared': the free pool, tests only. Or your own proxy URL (user:pass@host:port); then country, "
-        "region, city and proxy_type are not allowed."
+        description="Omit for the account default. 'premium': residential pool; 'mobile': mobile pool; "
+        "'shared': free pool, tests only; or your own proxy URL (user:pass@host:port), then without "
+        "country, region and city."
     ),
 ]
 Country = Annotated[
@@ -96,13 +109,9 @@ Region = Annotated[
     str | None, Field(description="Proxy exit state or region, with country.")
 ]
 City = Annotated[str | None, Field(description="Proxy exit city, with country.")]
-ProxyType = Annotated[
-    Literal["residential", "mobile"] | None,
-    Field(description="Pool for Surfsky proxies: 'residential' (default) or 'mobile'."),
-]
 OS = Annotated[
     Literal["win", "mac", "android"] | None,
-    Field(description="Fingerprint operating system. Not allowed with profile_uuid."),
+    Field(description="Fingerprint operating system. Not with profile_uuid."),
 ]
 OSVersion = Annotated[str | None, Field(description="Fingerprint OS version, with os.")]
 Arch = Annotated[
@@ -112,16 +121,16 @@ Arch = Annotated[
 Blocked = Annotated[
     list[Literal["image", "font", "media", "stylesheet"]] | None,
     Field(
-        description="Resource types the browser does not download: faster and less proxy traffic, but screenshots "
-        "and layout lose them."
+        description="Resource types not downloaded: faster and less proxy traffic, but screenshots and "
+        "layout lose them."
     ),
 ]
 WaitUntil = Annotated[
     Literal["domcontentloaded", "load", "networkidle", "commit"],
     Field(
-        description="Load state that ends the navigation: 'load' (default), 'domcontentloaded' (faster on heavy "
-        "pages; then surfsky_wait for what you need), 'commit' (first response received), 'networkidle' (no "
-        "requests for a while; busy pages never reach it and time out)."
+        description="Load state that ends the navigation: 'load' (default); 'domcontentloaded' (faster on heavy "
+        "pages; then surfsky_wait for what you need); 'commit' (first response); 'networkidle' (busy pages "
+        "never reach it and time out)."
     ),
 ]
 NavTimeout = Annotated[
@@ -137,47 +146,90 @@ MaxChars = Annotated[
 OnlyMain = Annotated[
     bool,
     Field(
-        description="Drop navigation, headers, footers, asides and forms; keep the main or article content."
+        description="Keep the main or article content; drop navigation, headers, footers, asides and forms."
     ),
 ]
 IncludeSnapshot = Annotated[
     bool,
-    Field(
-        description="Include a fresh snapshot of interactive elements in the result (default true)."
-    ),
+    Field(description="Include a snapshot of interactive elements (default true)."),
 ]
 
 ToolFn = Callable[..., Awaitable[CallToolResult]]
 
 
-TOOLS: list[tuple[str, ToolFn, str, ToolAnnotations]] = []
+def refuse_unknown(extra: dict[str, Any] | None) -> None:
+    if extra:
+        raise UsageError(f"unknown argument: {', '.join(extra)}")
 
 
-def tool(title: str, annotations: ToolAnnotations) -> Callable[[ToolFn], ToolFn]:
+TOOLS: list[tuple[str, ToolFn, str, ToolAnnotations, dict[str, Any] | None]] = []
+
+
+def tool(
+    title: str, annotations: ToolAnnotations, meta: dict[str, Any] | None = None
+) -> Callable[[ToolFn], ToolFn]:
     """Register a tool whose every failure is an is_error result with a stable code."""
 
     def decorate(fn: ToolFn) -> ToolFn:
         @functools.wraps(fn)
-        async def run(*args: Any, **kwargs: Any) -> CallToolResult:
+        async def run(
+            *args: Any, unknown: dict[str, Any] | None = None, **kwargs: Any
+        ) -> CallToolResult:
             try:
+                refuse_unknown(unknown)
                 return await fn(*args, **kwargs)
             except Exception as exc:
                 return error_result(exc)
 
-        TOOLS.append((run.__name__, run, title, annotations))
+        TOOLS.append((run.__name__, run, title, annotations, meta))
         return run
 
     return decorate
 
 
+def slim(node: Any, defs: dict[str, Any]) -> Any:
+    """A listed schema without what pydantic generates for itself: titles, defaults,
+    `anyOf [X, null]` for an optional X, and `$defs` used once."""
+    if isinstance(node, list):
+        return [slim(item, defs) for item in node]
+    if not isinstance(node, dict):
+        return node
+    if "$ref" in node:
+        return slim(defs[node["$ref"].rpartition("/")[2]], defs)
+    kept = {
+        key: {name: slim(schema, defs) for name, schema in value.items()}
+        if key == "properties"
+        else slim(value, defs)
+        for key, value in node.items()
+        if key not in ("title", "default", "$defs")
+    }
+    options = [option for option in kept.get("anyOf", []) if option != {"type": "null"}]
+    if len(options) == 1:
+        del kept["anyOf"]
+        kept = {**options[0], **kept}
+    return kept
+
+
 def register(server: MCPServer) -> None:
-    for name, run, title, annotations in TOOLS:
+    for name, run, title, annotations, meta in TOOLS:
         server.tool(
             name=name,
             title=title,
             description=inspect.cleandoc(run.__doc__ or ""),
             annotations=annotations,
+            meta=meta,
         )(run)
+        listed = server._tool_manager.get_tool(name)
+        assert listed is not None
+        listed.parameters = slim(listed.parameters, listed.parameters.get("$defs", {}))
+
+        class Arguments(listed.fn_metadata.arg_model):  # ty: ignore[unsupported-base]
+            model_config = ConfigDict(extra="allow")
+
+            def model_dump_one_level(self) -> dict[str, Any]:
+                return {**super().model_dump_one_level(), "unknown": self.model_extra}
+
+        listed.fn_metadata.arg_model = Arguments
 
 
 def get_registry(ctx: Context) -> SessionRegistry:
@@ -194,12 +246,15 @@ def acquire(
 ) -> AbstractAsyncContextManager[BrowserSession]:
     """The named session, else the connection's current one, else the default one."""
     registry = get_registry(ctx)
-    return registry.acquire(session_id or registry.current.get(connection_id(ctx)))
+    return registry.acquire(session_id or registry.current_for(connection_id(ctx)))
 
 
 def connection_id(ctx: Context) -> str | None:
     # absent on stdio and on protocol revisions without a handshake
-    return (ctx.headers or {}).get("mcp-session-id")
+    if connection := (ctx.headers or {}).get("mcp-session-id"):
+        return connection
+    access = get_access_token()
+    return f"app:{access.subject}" if access and access.subject else None
 
 
 def session_options(
@@ -207,7 +262,6 @@ def session_options(
     country: Country,
     region: Region,
     city: City,
-    proxy_type: ProxyType,
     os: OS,
     os_version: OSVersion,
     arch: Arch,
@@ -215,11 +269,11 @@ def session_options(
 ) -> dict[str, Any]:
     """Session identity options in the CLI's names: `os_`, comma-separated `block`."""
     opts = {
-        "proxy": proxy,
+        "proxy": "premium" if proxy == "mobile" else proxy,
         "country": country,
         "region": region,
         "city": city,
-        "proxy_type": proxy_type,
+        "proxy_type": "mobile" if proxy == "mobile" else None,
         "os_": os,
         "os_version": os_version,
         "arch": arch,
@@ -244,6 +298,72 @@ async def navigate(
     return None
 
 
+async def detect(page: Any) -> dict[str, Any] | None:
+    """What the free captcha scan sees on the page; None when it does not answer."""
+    try:
+        with anyio.fail_after(DETECT_TIMEOUT):
+            return await page.send(
+                "Captcha.detect", {"timeout": int(DETECT_TIMEOUT * 1000)}
+            )
+    except (SurfskyError, TimeoutError):
+        return None
+
+
+async def pass_challenge(page: Any, deadline: float) -> str | None:
+    """Get past a bot challenge page with at most one solve, of the widget the scan
+    found on it. Captcha.solve without a type keeps solving until the page has no
+    captcha left, which would also solve, and bill, one on the page behind."""
+    if page.status not in CHALLENGE_STATUS:
+        return None
+    found = await detect(page)
+    if not (found and found.get("challenge_page")):
+        return None
+
+    def left() -> float:
+        return deadline - anyio.current_time()
+
+    widget_until = anyio.current_time() + WIDGET_WAIT
+    while (
+        found
+        and found.get("challenge_page")
+        and not found.get("detected")
+        and left() >= MIN_SOLVE
+        and anyio.current_time() < widget_until
+    ):
+        await anyio.sleep(WIDGET_POLL)
+        found = await detect(page)
+    solved, billed, late = False, "", False
+    if found and found.get("challenge_page") and found.get("detected"):
+        late = left() < MIN_SOLVE
+        if not late:
+            reply = {}
+            with suppress(SurfskyError), anyio.move_on_after(left()):
+                reply = await page.send(
+                    "Captcha.solve",
+                    {
+                        "type": found["captcha_type"],
+                        "options": {"selector": found["selector"]},
+                        # the reload and the scan after it fit in what is left
+                        "timeout": int((left() - SOLVE_RESERVE) * 1000),
+                    },
+                )
+            if cost := (reply.get("usage") or {}).get("cost_usd"):
+                billed = f" (billed ${cost:g})"
+            solved = reply.get("status") == "success"
+            if solved:
+                await anyio.sleep(CHALLENGE_RELOAD)
+                with suppress(SurfskyError):
+                    await page.wait_for_load_state("load", timeout=max(0.5, left() - 2))
+            # also after a failed solve: the page may have passed by itself meanwhile
+            found = await detect(page)
+    if found is not None and not found.get("challenge_page"):
+        outcome = "solved" if solved else "passed"
+    else:  # still there, or the scan gave no answer
+        outcome = "not solved, no time left in this call" if late else "not solved"
+        outcome += "; surfsky_scrape may get this page"
+    return f"challenge_page met, {outcome}{billed}"
+
+
 async def page_state(
     live: BrowserSession, **extra: Any
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -253,7 +373,8 @@ async def page_state(
         "url": await live.page.url(),
         **extra,
     }
-    page: dict[str, Any] = {"title": await live.page.title()}
+    # on one line: a break would start a forged row in a snapshot
+    page: dict[str, Any] = {"title": " ".join((await live.page.title()).split())}
     if live.note:
         header["note"], live.note = live.note, None
     if live.dialogs:
@@ -269,16 +390,16 @@ async def page_state(
 @tool("Account status", READ_ONLY)
 async def surfsky_status(ctx: Context) -> CallToolResult:
     """Check the Surfsky account this server uses: credentials, plan limits, proxy quota, and
-    the sessions this server owns (id, seconds idle, idle timeout). Read-only; starts no
-    browser. Use it when a tool returns an auth, quota or plan_full error, or before
-    starting parallel sessions to see how many the plan allows.
+    the sessions this server owns (id, seconds idle, idle timeout). Starts no browser. Use
+    it when a tool returns an auth, quota or plan_full error, or before starting parallel
+    sessions to see how many the plan allows.
     """
     reg = get_registry(ctx)
     access = get_access_token()
     settings = Settings()
-    if access is not None:
+    if access is not None and access.claims:
         settings = Settings(
-            api_token=access.token, base_url=(access.claims or {}).get("base_url")
+            api_token=access.claims["api_token"], base_url=access.claims.get("base_url")
         )
     info: dict[str, Any] = {
         "version": __version__,
@@ -299,7 +420,7 @@ async def surfsky_status(ctx: Context) -> CallToolResult:
     return result(info)
 
 
-@tool("Start a session", DESTRUCTIVE)
+@tool("Start a session", ACTING)
 async def surfsky_session_start(
     ctx: Context,
     profile_uuid: ProfileUuid = None,
@@ -307,7 +428,6 @@ async def surfsky_session_start(
     country: Country = None,
     region: Region = None,
     city: City = None,
-    proxy_type: ProxyType = None,
     os: OS = None,
     os_version: OSVersion = None,
     arch: Arch = None,
@@ -317,26 +437,25 @@ async def surfsky_session_start(
         Field(
             ge=1,
             le=3600,
-            description="Seconds without a tool call after which this server stops the session (default 300).",
+            description="Seconds without a tool call before the server stops the session (default 300).",
         ),
     ] = DEFAULT_IDLE_TIMEOUT,
     dialogs: Annotated[
         Literal["dismiss", "accept"],
         Field(
-            description="Answer for alert, confirm and prompt dialogs: 'dismiss' (default) or 'accept'. Each answered dialog is reported in the next result."
+            description="Answer to alert, confirm and prompt dialogs: 'dismiss' (default) or 'accept'. "
+            "Answered dialogs are reported in the next result."
         ),
     ] = "dismiss",
 ) -> CallToolResult:
-    """Start a cloud browser session and return its session_id for the other tools. Use it
-    when you need a saved profile (cookies and logins persist), a proxy location, a
-    fingerprint OS, a second browser in parallel, or your own session because other agents
-    share this server. On the hosted server call it first: the browser tools then use
-    the session you started. On a local server skip it without those needs: the browser
-    tools share a default session on their own. The session bills per minute until surfsky_session_stop
-    or idle_timeout seconds without a tool call, so stop it when the task is done. It opens
-    on about:blank; call surfsky_navigate next. The result's screencast URL is a live view
-    for the user and is private. Use only a profile_uuid the user gave you: a profile
-    carries real logins.
+    """Start a cloud browser session and return its session_id. The hosted server needs it
+    before any browser tool. A local server needs it only for a saved profile, a proxy
+    location, a fingerprint OS, a second browser in parallel, or a session of your own
+    when other agents share the server; otherwise the browser tools share a default
+    session. The session bills per minute until surfsky_session_stop or idle_timeout
+    seconds without a tool call: stop it when the task is done. It opens on about:blank;
+    call surfsky_navigate next. The result's live_url lets the user watch the browser
+    and act in it: give it only to the user.
     """
     if profile_uuid and (os or os_version or arch):
         raise UsageError(
@@ -345,20 +464,24 @@ async def surfsky_session_start(
     if not 1 <= idle_timeout <= 3600:
         raise UsageError("idle_timeout is 1..3600 seconds")
     options = session_options(
-        proxy, country, region, city, proxy_type, os, os_version, arch, block_resources
+        proxy, country, region, city, os, os_version, arch, block_resources
     )
     registry = get_registry(ctx)
     live = await registry.start(
-        profile_uuid=profile_uuid, idle_timeout=idle_timeout, dialogs=dialogs, **options
+        owner=connection_id(ctx) if registry.hosted else None,
+        profile_uuid=profile_uuid,
+        idle_timeout=idle_timeout,
+        dialogs=dialogs,
+        **options,
     )
-    if registry.hosted and (connection := connection_id(ctx)):
-        registry.current[connection] = live.id
+    urls = cli.urls(live.session)  # built from the start reply, no further API call
     return result(
         {
             "session_id": live.id,
             "profile_uuid": profile_uuid,
             "idle_timeout": live.idle_timeout,
-            **cli.urls(live.session),
+            "live_url": urls.pop("screencast", None),
+            **urls,
             "note": f"bills per minute until surfsky_session_stop or {live.idle_timeout} s without a tool call",
         }
     )
@@ -369,14 +492,11 @@ async def surfsky_session_stop(
     ctx: Context,
     session_id: Annotated[
         str,
-        Field(
-            description="The session to stop: from surfsky_session_start, a result header, or surfsky_session_list."
-        ),
+        Field(description="The session to stop: any session id on the account."),
     ],
 ) -> CallToolResult:
     """Stop a session and its billing. Use it when a task is done, or to clean up a leaked
-    session found with surfsky_session_list. Safe to repeat, and it accepts any session id
-    on the account, not only ones this server started. A saved profile's cookies and
+    session found with surfsky_session_list. Safe to repeat. A saved profile's cookies and
     logins are stored on a normal stop. Stopping the default session is fine: the next
     browser tool call starts a fresh one.
     """
@@ -394,8 +514,7 @@ async def surfsky_session_stop(
 async def surfsky_session_list(ctx: Context) -> CallToolResult:
     """List the account's running sessions: session_id, profile_uuid, started_at,
     active_seconds, whether this server started it (owned) and whether it is this
-    server's default. Read-only. Use it to find leaked sessions to stop, or the default
-    session's id.
+    server's default. Use it to find leaked sessions to stop.
     """
     reg = get_registry(ctx)
     active = await reg.client().profiles.list_active()
@@ -421,27 +540,72 @@ async def surfsky_session_list(ctx: Context) -> CallToolResult:
 # --- navigate and read -------------------------------------------------------------
 
 
+def save_refs(
+    live: BrowserSession, url: str, data: dict[str, Any], *, merge: bool = False
+) -> None:
+    """Replace the refs with the rows'. `merge` keeps those of this tab and URL:
+    `find` lists a part of the page, and the agent may hold a ref from a fuller
+    snapshot. Not after an action, which may have moved elements between selectors."""
+    state = live.state
+    same_page = merge and (state.get("refs_target_id"), state.get("refs_url")) == (
+        live.page.target_id,
+        url,
+    )
+    refs = state.get("refs") if same_page else None
+    names = state.get("ref_names") if same_page else None
+    snapshot.save_refs(state, live.page.target_id, url, data)
+    state["refs"] = {**(refs or {}), **state["refs"]}
+    state["ref_names"] = {
+        **(names or {}),
+        **{
+            str(item["ref"]): [item["role"], item.get("name", "")]
+            for item in data["items"]
+        },
+    }
+
+
 def snapshot_digest(url: str, data: dict[str, Any]) -> str:
     return hashlib.sha1(
         json.dumps([url, data["items"]], sort_keys=True).encode()
     ).hexdigest()
 
 
-def add_snapshot(
-    page: dict[str, Any], data: dict[str, Any]
-) -> tuple[dict[str, Any], str]:
-    """Put the walker's result under `page` and render it for the fence."""
-    page["snapshot"] = data["items"]
-    page["total"] = data["total"]
-    page["unreachable"] = data.get("unreachable") or []
-    lines = snapshot.render_items(data).replace(
-        "raise --limit", "surfsky_snapshot with a higher limit lists them"
-    )
-    body = f"title: {page['title']}"
+def snapshot_result(
+    header: dict[str, Any],
+    page: dict[str, Any],
+    data: dict[str, Any],
+    details: bool = False,
+) -> CallToolResult:
+    """The walker's rows as text only: a host feeds the model a result's structured
+    content when it has one, and a row costs twice as much there.
+
+    A ref targets a row, so its selector is left out, and its href too unless
+    another row has the same role and name."""
+    if missing := data["total"] - len(data["items"]):
+        header["more"] = (
+            f"{missing} more elements: surfsky_snapshot with find= or a higher limit lists them"
+        )
+    lines = [f"title: {page['title']}"]
     for dialog in page.get("dialogs") or []:
         verdict = "accepted" if dialog["accepted"] else "dismissed"
-        body += f"\ndialog: {dialog['kind']} {json.dumps(dialog['message'], ensure_ascii=False)} {verdict}"
-    return page, f"{body}\n{lines}" if lines else body
+        lines.append(
+            f"dialog: {dialog['kind']} {json.dumps(dialog['message'], ensure_ascii=False)} {verdict}"
+        )
+    same = Counter((item["role"], item.get("name")) for item in data["items"])
+    for item in data["items"]:
+        if not details and same[item["role"], item.get("name")] == 1:
+            item = {key: value for key, value in item.items() if key != "href"}
+        row = snapshot.render_items({"items": [item], "total": 1})
+        if details:
+            row += f" selector={snapshot.token(item['selector'])}"
+        lines.append(row)
+    if unreachable := data.get("unreachable"):
+        lines.append(
+            snapshot.render_items({"items": [], "total": 0, "unreachable": unreachable})
+        )
+    out = result(header, page, body="\n".join(lines))
+    out.structured_content = None
+    return out
 
 
 async def action_result(
@@ -451,6 +615,7 @@ async def action_result(
     want_snapshot: bool,
     status: bool = False,
     action: bool = False,
+    **extra: Any,
 ) -> CallToolResult:
     """Settle, then report where the page is; with a snapshot, refresh refs and `changed`."""
     data = (
@@ -458,13 +623,14 @@ async def action_result(
         if want_snapshot
         else None
     )
-    header, page = await page_state(live)
+    if data and (note := data.pop("note", None)):
+        live.note = f"{live.note}; {note}" if live.note else note
+    header, page = await page_state(live, **extra)
     header["navigated"] = header["url"] != before
     if status:
         header["status"] = live.page.status
-    body = None
     if data is not None:
-        snapshot.save_refs(live.state, live.page.target_id, header["url"], data)
+        save_refs(live, header["url"], data)
         new = snapshot_digest(header["url"], data)
         changed = header["navigated"] or new != live.snapshot_hash
         live.snapshot_hash = new
@@ -474,24 +640,20 @@ async def action_result(
                 header["hint"] = (
                     "nothing observable changed; take a fresh snapshot or wait before repeating the action"
                 )
-        page, body = add_snapshot(page, data)
-    return result(header, page, body=body)
+        return snapshot_result(header, page, data)
+    return result(header, page)
 
 
-@tool("Navigate", DESTRUCTIVE)
+@tool("Navigate", ACTING)
 async def surfsky_navigate(
     ctx: Context,
     url: Annotated[
         str | None,
-        Field(
-            description="URL to open; https:// is added when the scheme is missing. Give url or go, not both."
-        ),
+        Field(description="URL to open; https:// is added when missing. Give url or go."),
     ] = None,
     go: Annotated[
         Literal["back", "forward", "reload"] | None,
-        Field(
-            description="History step instead of a URL: 'back', 'forward' or 'reload'."
-        ),
+        Field(description="History step instead of a URL."),
     ] = None,
     session_id: SessionId = None,
     wait_until: WaitUntil = "load",
@@ -499,19 +661,21 @@ async def surfsky_navigate(
     snapshot: IncludeSnapshot = True,
 ) -> CallToolResult:
     """Open a URL in the session's active tab (or go back, forward or reload) and return
-    where it landed: final url, HTTP status, navigated, and a snapshot of the visible
-    interactive elements with @N refs for surfsky_act. Use it for a page that needs
-    clicks, scrolling, a form or a login; for a page you only need to read once,
-    surfsky_scrape is cheaper and starts no session. Without session_id it uses the shared
-    default session, starting one on first use. A status of 200 does not prove the real
-    page loaded: bot challenges and interstitials return 200 too, so check the title and
-    snapshot for the expected content before repeating a submission. The snapshot holds up
-    to 300 rows; surfsky_snapshot with a higher limit lists the rest.
+    where it landed: final url, HTTP status, navigated, and a snapshot of the first 80
+    visible interactive elements with @N refs for surfsky_act; surfsky_snapshot with
+    find= or a higher limit lists the rest. Use it for a page that needs clicks,
+    scrolling, a form or a login; to only read a page, surfsky_scrape is cheaper and
+    starts no session. A bot challenge page gets one solve of its own widget, billed
+    as a captcha solve where the account pays for solving, and note reports it; a
+    captcha on an ordinary page is never solved here. If note says not solved, or the
+    title and snapshot lack the expected content, the page is not the real one
+    whatever the status.
     """
     if (url is None) == (go is None):
         raise UsageError("pass url, or go (back, forward, reload), not both")
     async with acquire(ctx, session_id) as live:
         page = live.page
+        deadline = anyio.current_time() + NAVIGATE_BUDGET
         before = await page.url()
         if url is not None:
             nav = page.goto(with_scheme(url), wait_until=wait_until, timeout=timeout)
@@ -522,8 +686,12 @@ async def surfsky_navigate(
             if await step(timeout=timeout) is None:
                 raise UsageError("no further history")
             nav = page.wait_for_load_state(wait_until, timeout=timeout)
-        if note := await navigate(page, nav, wait_until, before):
-            live.note = f"{live.note}; {note}" if live.note else note
+        for note in (
+            await navigate(page, nav, wait_until, before),
+            await pass_challenge(page, deadline),
+        ):
+            if note:
+                live.note = f"{live.note}; {note}" if live.note else note
         return await action_result(live, before, want_snapshot=snapshot, status=True)
 
 
@@ -533,43 +701,47 @@ async def surfsky_snapshot(
     session_id: SessionId = None,
     interactive_only: Annotated[
         bool,
-        Field(
-            description="Leave out heading rows; list only elements that can be acted on."
-        ),
+        Field(description="List only elements that can be acted on, without headings."),
     ] = False,
     find: Annotated[
         str | None,
         Field(
             description="Case-insensitive substring matched against each element's role, name, href and CSS "
-            "selector; numbering stays as in the full snapshot."
+            "selector; a|b matches either."
         ),
     ] = None,
     limit: Annotated[
         int,
         Field(
             ge=1,
-            description="Maximum rows returned (default 500); the result says how many more matched.",
+            description="Maximum rows (default 500); the result says how many more matched.",
         ),
     ] = 500,
+    details: Annotated[
+        bool,
+        Field(description="Add every link's href and each row's CSS selector."),
+    ] = False,
 ) -> CallToolResult:
     """List the visible interactive elements (links, buttons, inputs, selects) and headings
-    of the active tab as '[@N] role "name"' lines, with href, value, checked, options and
-    disabled where present; use @N as the target of surfsky_act. Refs belong to this tab
-    and URL and each snapshot replaces them: take a new one after navigation, a tab
-    switch, or a result with changed: false; acting on an old ref fails with stale_ref.
-    find narrows the list without renumbering. Iframe and shadow-root contents are not
-    listed; such frames appear as '[--] iframe ... (content not reachable)'. For the page
-    text use surfsky_read; for how it looks, surfsky_screenshot.
+    of the active tab as '[@N] role "name"' rows, with value, checked, options and
+    disabled where present, and href for links that share a name; @N is a target for
+    surfsky_act. Refs belong to this tab and URL: after a navigation an old ref fails
+    with stale_ref. find narrows the list without renumbering. Iframe and shadow-root
+    contents are not listed; they appear as '[--] iframe ... (content not reachable)'.
+    For the page text use surfsky_read.
     """
     async with acquire(ctx, session_id) as live:
         data = await snapshot.take(
             live.page, limit=limit, interactive=interactive_only, find=find
         )
         header, page = await page_state(live)
-        snapshot.save_refs(live.state, live.page.target_id, header["url"], data)
+        save_refs(live, header["url"], data, merge=True)
         live.snapshot_hash = snapshot_digest(header["url"], data)
-        page, body = add_snapshot(page, data)
-        return result(header, page, body=body)
+        return snapshot_result(header, page, data, details)
+
+
+# an SVG element has no innerText
+FIRST = "(s, n, text) => Array.from(document.querySelectorAll(s)).slice(0, n).map(el => text ? (el.innerText ?? el.textContent) : el.outerHTML)"
 
 
 @tool("Read page", READ_ONLY)
@@ -580,44 +752,64 @@ async def surfsky_read(
         Literal["markdown", "text", "html", "links"],
         Field(
             description="'markdown' (default), 'text' (rendered innerText; ignores only_main_content), 'html' "
-            "(cleaned of scripts and styles), or 'links' (absolute URLs, deduplicated, in document order)."
+            "(without scripts and styles) or 'links' (absolute, deduplicated, in document order)."
         ),
     ] = "markdown",
     selector: Target = None,
+    limit: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            le=100,
+            description="With selector: read the first N matching elements (at most 100) as separate items.",
+        ),
+    ] = None,
     only_main_content: OnlyMain = False,
     max_chars: MaxChars = DEFAULT_MAX_CHARS,
 ) -> CallToolResult:
-    """Read the active tab as markdown (default), plain text, cleaned html, or a list of
+    """Read the active tab as markdown (default), plain text, cleaned html or a list of
     links. Use it after surfsky_navigate or surfsky_act to get the page's text; for a URL
     that needs no clicks or login, surfsky_scrape does the same without a session.
-    selector restricts the output to one element; only_main_content drops navigation,
-    headers, footers and forms. Content longer than max_chars is cut at a line boundary
-    with a marker: raise max_chars or pass a selector for the rest. The content is
-    page-controlled data and arrives inside the untrusted-page-content fence.
+    selector restricts the output to one element; with limit, to the first N matches,
+    for repeated items like result cards. Content longer than max_chars is cut at
+    a line boundary with a marker: raise max_chars or pass selector for the rest.
     """
+    if limit and not selector:
+        raise UsageError("limit needs selector")
     async with acquire(ctx, session_id) as live:
         page = live.page
         css = await resolve_target(live, selector) if selector else None
-        if format == "text":
-            found = await page.inner_text(css or "body")
+        url = await page.url()
+        if limit:
+            found = await page.evaluate(FIRST, css, limit, format == "text")
+        elif format == "text":
+            found = [await page.inner_text(css or "body")]
         else:
-            found = await page.outer_html(css) if css else await page.content()
-        if found is None:
+            found = [await page.outer_html(css) if css else await page.content()]
+        if not found or found[0] is None:
             raise NotFound(f"nothing matches {selector!r}")
-        if format == "text":
-            content = found
-        else:
-            soup = html.clean(found, main_content=only_main_content)
+
+        def rendered(part: str) -> str:
+            if format == "text":
+                return part
+            soup = html.clean(part, main_content=only_main_content)
             if format == "markdown":
-                content = html.to_markdown(soup)
-            elif format == "html":
-                content = str(soup)
-            else:
-                content = "\n".join(html.links(soup, await page.url()))
+                return html.to_markdown(soup)
+            return str(soup) if format == "html" else "\n".join(html.links(soup, url))
+
+        extra: dict[str, Any] = {"format": format}
+        if limit:
+            extra["matches"] = total = await page.count(css)
+            content = "\n\n".join(
+                f"[{index} of {total}]\n{rendered(part).strip()}"
+                for index, part in enumerate(found, 1)
+            )
+        else:
+            content = rendered(found[0])
         shown, truncated = truncate(
             content, max_chars, hint=f"raise max_chars up to {MAX_CHARS} or pass selector"
         )
-        header, page_data = await page_state(live, format=format)
+        header, page_data = await page_state(live, **extra)
         if truncated:
             header["truncated"] = True
             header["total_chars"] = len(content)
@@ -637,11 +829,12 @@ async def surfsky_screenshot(
     ] = False,
     selector: Target = None,
 ) -> CallToolResult:
-    """Capture the active tab as an image you can see: the viewport as JPEG by default, or
-    PNG for the full page or one element (selector). Use it to check a visual state, such
-    as a challenge page, a layout or a chart, or to find something the snapshot does not
-    list; for reading text, surfsky_read is cheaper and exact. A full-page capture of a
-    long page is large.
+    """Capture the active tab as an image: the viewport as JPEG, or PNG for the full page
+    or one element (selector). Take one only when the user asks for an image or the
+    answer depends on how the page looks: a layout, a chart, or a captcha or canvas the
+    text tools cannot read. Not to check that an action worked: its result already
+    carries the page state. For what can be clicked use surfsky_snapshot; for content,
+    surfsky_read.
     """
     async with acquire(ctx, session_id) as live:
         await live.page.bring_to_front()  # a hidden tab's capture hangs
@@ -660,7 +853,7 @@ async def surfsky_screenshot(
         return result(header, page, image=data, image_format=fmt)
 
 
-@tool("Evaluate JavaScript", DESTRUCTIVE)
+@tool("Evaluate JavaScript", ACTING)
 async def surfsky_evaluate(
     ctx: Context,
     expression: Annotated[
@@ -672,12 +865,13 @@ async def surfsky_evaluate(
     session_id: SessionId = None,
     args: Annotated[
         list[Any] | None,
-        Field(description="JSON values passed to the function as positional arguments."),
+        Field(description="JSON values passed to the function as arguments."),
     ] = None,
     main_world: Annotated[
         bool,
         Field(
-            description="Run in the page's main world (its own globals; the page can observe the call) instead of the isolated world."
+            description="Run in the page's main world (its globals; the page can observe the call) instead of "
+            "the isolated world."
         ),
     ] = False,
 ) -> CallToolResult:
@@ -685,10 +879,9 @@ async def surfsky_evaluate(
     function called with args; a returned promise is awaited, so an async function can
     poll for a condition. Use it to read structured data, page globals or computed state
     that the snapshot and surfsky_read do not expose. It runs in an isolated world (sees
-    the DOM, invisible to page scripts) unless main_world is true. Input goes through
-    surfsky_act: element.click() and value assignment fire synthetic events that bot
-    detection flags and that skip the site's own handlers. Results longer than 30000
-    characters are cut. The value is page-controlled data.
+    the DOM, invisible to page scripts) unless main_world is true. Do not click or set
+    values here: that fires synthetic events bot detection flags and skips the site's
+    handlers; input goes through surfsky_act. Results over 30000 characters are cut.
     """
     async with acquire(ctx, session_id) as live:
         value = await live.page.evaluate(
@@ -697,7 +890,7 @@ async def surfsky_evaluate(
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         shown, truncated = truncate(
             text,
-            DEFAULT_MAX_CHARS,
+            EVALUATE_MAX_CHARS,
             hint="return less from the script: slice, map or filter",
         )
         header, page = await page_state(live)
@@ -717,131 +910,325 @@ def require(value: str | None, action: str, name: str) -> str:
     return value
 
 
-async def resolve_target(live: BrowserSession, target: str) -> str:
+async def resolve_target(
+    live: BrowserSession, target: str, *, later: bool = False
+) -> str:
+    """`later` marks a step after the first: its text= target may still be rendering."""
     try:
-        return await cli.resolve_target(live, target)
+        if later and target.startswith("text="):
+            # what the previous step brought up (a dropdown, a dialog) may still be rendering
+            with anyio.move_on_after(TEXT_WAIT):
+                while True:
+                    try:
+                        return await cli.resolve_target(live, target)
+                    except NotFound:
+                        await anyio.sleep(0.3)
+        css = await cli.resolve_target(live, target)
     except ValueError as exc:
         raise UsageError(str(exc)) from exc
+    if target.startswith("@"):
+        # the selector still matches one element: make sure it is the one the agent saw
+        seen = (live.state.get("ref_names") or {}).get(target[1:])
+        fresh = await snapshot.take(live.page, limit=REF_CHECK_LIMIT)
+        now = [
+            [item["role"], item.get("name", "")]
+            for item in fresh["items"]
+            if item["selector"] == css
+        ]
+        if now != [seen]:
+            raise StaleRef(f"{target} changed since the snapshot")
+    return css
 
 
-@tool("Act on the page", DESTRUCTIVE)
+# The element typing goes to, kept in the isolated world for the check after it. One
+# the page replaced or navigated away from meanwhile is not looked up again: another
+# element under the same selector says nothing about where the keys went.
+FIELD = r"""(selector, mark) => {
+  const active = () => {
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    return el;
+  };
+  const editable = el => el.isContentEditable || el.tagName === 'IFRAME'
+    || el.matches('textarea, [role=textbox], [role=combobox], [role=searchbox], input:not([type=button],'
+      + ' [type=submit], [type=reset], [type=checkbox], [type=radio], [type=file], [type=image],'
+      + ' [type=range], [type=color])');
+  if (mark) globalThis.__surfskyField = selector ? document.querySelector(selector) : active();
+  const el = globalThis.__surfskyField;
+  if (!el || !el.isConnected) return null;
+  const value = el.matches('input, textarea') ? el.value : el.isContentEditable ? el.innerText : null;
+  return {editable: editable(el), value, focused: active() === el};
+}"""
+
+
+async def enter(
+    page: Any, css: str | None, text: str, target: str, replace: bool = False
+) -> None:
+    """Type into `css`, or into the focused element.
+
+    Human.type goes to whatever has focus, and a page can move it: a dialog that
+    opens under the click or between the click and the keys. Typing is repeated only
+    when no key was sent; after that the page may have used the text (a chat box that
+    clears itself, a code field that submits) and a second run would double it."""
+    before = await page.evaluate(FIELD, css, True)
+    if css is None:
+        if not (before and before["editable"]):
+            raise ValueError(
+                "no editable element has focus; type with the field as target"
+            )
+        await page.keyboard.type(text)
+    else:
+        send = page.fill if replace else page.type
+        try:
+            await send(css, text)
+        except ValueError as exc:
+            if "did not take focus" not in str(exc):
+                raise
+            await anyio.sleep(REFOCUS_WAIT)  # the click did not focus it: no key was sent
+            try:
+                await send(css, text)
+            except ValueError:
+                # the SDK's message carries the selector, which the page controls
+                raise ValueError(f"{target} did not take focus") from None
+    after = None
+    with suppress(SurfskyError):  # typing that navigates leaves no field to read
+        after = await page.evaluate(FIELD, css, False)
+    # anything else is the page's own handling of the text: a mask, a field that clears
+    if (
+        text
+        and before
+        and after
+        and isinstance(after["value"], str)
+        and after["value"] == before["value"]
+        and not after["focused"]
+        and " ".join(text.split()) not in " ".join(after["value"].split())
+    ):
+        raise ValueError(
+            "the page moved focus away while typing and the text did not arrive: "
+            "a dialog may have opened"
+        )
+
+
+Action = Literal[
+    "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll"
+]
+Modifiers = list[Literal["Alt", "Control", "Meta", "Shift"]]
+NEEDS: dict[str, tuple[str, ...]] = {
+    "click": ("target",),
+    "dblclick": ("target",),
+    "hover": ("target",),
+    "fill": ("target", "text"),
+    "type": ("text", "target"),
+    "press": ("key",),
+    "select": ("target", "value"),
+    "scroll": (),
+}
+
+
+class Step(BaseModel):
+    # unknown fields are refused by name in surfsky_act
+    model_config = ConfigDict(
+        extra="allow", json_schema_extra={"additionalProperties": False}
+    )
+
+    action: Action
+    target: str | None = None
+    text: str | None = None
+    key: str | None = None
+    value: str | None = None
+    modifiers: Modifiers | None = None
+    delta_y: float | None = None
+
+
+async def perform(live: BrowserSession, step: Step, timeout: float, later: bool) -> None:
+    page = live.page
+    target = step.target or ""
+    match step.action:
+        case "click" | "dblclick" | "hover":
+            css = await resolve_target(live, target, later=later)
+            if step.action == "hover":
+                await page.hover(css, timeout=timeout)
+            elif step.action == "click":
+                await page.click(css, modifiers=step.modifiers, timeout=timeout)
+            else:
+                await page.dblclick(css, modifiers=step.modifiers, timeout=timeout)
+        case "fill":
+            css = await resolve_target(live, target, later=later)
+            await enter(page, css, step.text or "", target, replace=True)
+        case "type":
+            css = (
+                None
+                if target == cli.FOCUSED
+                else await resolve_target(live, target, later=later)
+            )
+            await enter(page, css, step.text or "", target)
+        case "press":
+            await page.keyboard.press(step.key, modifiers=step.modifiers)
+        case "select":
+            css = await resolve_target(live, target, later=later)
+            try:
+                try:
+                    await page.select_option(css, step.value)
+                except ValueError:
+                    await page.select_option(css, label=step.value)
+            except ValueError:
+                # the SDK's message carries the selector, which the page controls
+                raise NotFound(f"{target} has no option {step.value!r}") from None
+        case "scroll":
+            if target:
+                css = await resolve_target(live, target, later=later)
+                await page.scroll_into_view(css)
+            else:
+                dy = step.delta_y
+                if dy is None:  # a reader paging: most of a screen, no page JS
+                    metrics = await page.send("Page.getLayoutMetrics")
+                    dy = round(
+                        metrics["cssVisualViewport"]["clientHeight"]
+                        * random.uniform(0.6, 0.9)
+                    )
+                await page.scroll(delta_y=dy)
+
+
+async def step_failure(
+    live: BrowserSession,
+    before: str,
+    exc: Exception,
+    index: int,
+    steps: list[Step],
+    hint: str | None = None,
+) -> CallToolResult:
+    """The failed step's error with the page as the steps before it left it."""
+    failed = error_result(exc, hint=hint)
+    error = (failed.structured_content or {})["error"]
+    error["step"] = index + 1
+    done = (
+        "no step is done"
+        if index == 0
+        else "step 1 is done"
+        if index == 1
+        else f"steps 1-{index} are done"
+    )
+    head = cast(TextContent, failed.content[0]).text.replace(
+        f"error [{error['code']}]:",
+        f"error [{error['code']}] at step {index + 1} of {len(steps)} ({steps[index].action}):",
+        1,
+    )
+    failed.content = [TextContent(type="text", text=head)]
+    try:
+        state = await action_result(live, before, want_snapshot=True)
+    except Exception:
+        return failed
+    text = f"{head}\n{done}; the page is now:\n{cast(TextContent, state.content[0]).text}"
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content={"error": error},
+        is_error=True,
+    )
+
+
+@tool("Act on the page", ACTING)
 async def surfsky_act(
     ctx: Context,
     action: Annotated[
-        Literal[
-            "click", "dblclick", "hover", "fill", "type", "press", "select", "scroll"
-        ],
-        Field(
-            description="click, dblclick, hover (target); fill (target, text); type (target, text); press (key); "
-            "select (target, value); scroll (target, or delta_y, or neither)."
-        ),
-    ],
+        Action | None,
+        Field(description="The action to perform; or pass steps."),
+    ] = None,
     session_id: SessionId = None,
     target: Target = None,
-    text: Annotated[
-        str | None,
-        Field(
-            description="Text for fill (replaces the field's value) or type (keystrokes appended to it)."
-        ),
-    ] = None,
+    text: Annotated[str | None, Field(description="Text for fill or type.")] = None,
     key: Annotated[
         str | None,
         Field(
-            description="Key for press: a name such as Enter, Tab, Escape, Backspace, ArrowDown, or a combination like Control+A."
+            description="Key for press: Enter, Tab, Escape, Backspace, ArrowDown, or a combination like Control+A."
         ),
     ] = None,
     value: Annotated[
         str | None,
-        Field(
-            description="Option to choose for select: its value attribute, or its visible label with by_label."
-        ),
+        Field(description="Option for select: its value attribute or its visible label."),
     ] = None,
-    by_label: Annotated[
-        bool,
-        Field(
-            description="Match value against the option's visible label instead of its value attribute."
-        ),
-    ] = False,
     modifiers: Annotated[
-        list[Literal["Alt", "Control", "Meta", "Shift"]] | None,
+        Modifiers | None,
         Field(description="Modifier keys held during click, dblclick or press."),
     ] = None,
     delta_y: Annotated[
         float | None,
+        Field(description="Pixels to scroll the page: positive down, negative up."),
+    ] = None,
+    steps: Annotated[
+        list[Step] | None,
         Field(
-            description="Pixels to scroll the page for scroll without target: positive down, negative up. Default: most of a screen down."
+            description=f"Up to {MAX_STEPS} actions run in order, instead of action: objects with the same "
+            "fields (action, target, text, key, value, modifiers, delta_y). After a step that "
+            "changes the page, target by CSS selector or text=words: @N refs are from the snapshot before "
+            "the call."
         ),
     ] = None,
     timeout: Annotated[
         float,
         Field(
             gt=0,
-            description="Seconds allowed for the action, including finding the element (default 10).",
+            le=MAX_ELEMENT_TIMEOUT,
+            description="Seconds allowed per action, including finding the element (default 10, at most 30).",
         ),
     ] = ELEMENT_TIMEOUT,
     snapshot: IncludeSnapshot = True,
 ) -> CallToolResult:
-    """Perform one input action on the active tab with human-like mouse and keyboard, then
-    settle and return the page state (url, navigated, changed) plus a fresh snapshot with
-    @N refs. Use it for every click, form entry and keypress. Per action: click, dblclick,
-    hover take target; fill takes target and text and replaces the value; type takes
-    target and text and appends keystrokes (target '@focused' types into the focused
-    element without clicking); press takes key; select takes target and value; scroll
-    takes target (scrolls it into view) or delta_y, and with neither scrolls most of a
-    screen down. changed: false in the result means nothing observable happened: snapshot
-    or wait instead of repeating the action. Actions hit the live site and submissions have
-    real side effects: stop before a payment or final confirmation the user did not ask for.
+    """Perform input on the active tab with human-like mouse and keyboard, then return the
+    page state (url, navigated, changed) and a fresh snapshot with @N refs. Use it for
+    every click, form entry and keypress; pass steps to run a known sequence (fill a
+    form, then submit) in one call. Actions: click, dblclick, hover (target); fill
+    (target, text: replaces the value); type (target, text: appends keystrokes; target
+    '@focused' types into the focused element without clicking); press (key); select
+    (target, value); scroll (target scrolls it into view, delta_y scrolls the page,
+    neither scrolls most of a screen down). steps stop at the first failure: the error
+    names the step and carries the page state and snapshot to continue from. changed:
+    false means nothing observable happened: snapshot or wait instead of repeating.
+    Stop before a payment or final confirmation the user did not ask for.
     """
+    if (action is None) == (steps is None):
+        raise UsageError("pass action, or steps, not both")
+    if steps is not None and not 1 <= len(steps) <= MAX_STEPS:
+        raise UsageError(f"steps takes 1 to {MAX_STEPS} actions")
+    todo = steps or [
+        Step(
+            action=cast(Action, action),
+            target=target,
+            text=text,
+            key=key,
+            value=value,
+            modifiers=modifiers,
+            delta_y=delta_y,
+        )
+    ]
+    for step in todo:
+        refuse_unknown(step.model_extra)
+        for name in NEEDS[step.action]:
+            require(getattr(step, name), step.action, name)
     async with acquire(ctx, session_id) as live:
-        page = live.page
-        before = await page.url()
-        with anyio.fail_after(timeout):
-            match action:
-                case "click" | "dblclick" | "hover":
-                    css = await resolve_target(live, require(target, action, "target"))
-                    if action == "hover":
-                        await page.hover(css, timeout=timeout)
-                    elif action == "click":
-                        await page.click(css, modifiers=modifiers, timeout=timeout)
-                    else:
-                        await page.dblclick(css, modifiers=modifiers, timeout=timeout)
-                case "fill":
-                    css = await resolve_target(live, require(target, action, "target"))
-                    await page.fill(css, require(text, action, "text"))
-                case "type":
-                    words = require(text, action, "text")
-                    target = require(target, action, "target")
-                    if target == cli.FOCUSED:
-                        await page.keyboard.type(words)
-                    else:
-                        await page.type(await resolve_target(live, target), words)
-                case "press":
-                    await page.keyboard.press(
-                        require(key, action, "key"), modifiers=modifiers
-                    )
-                case "select":
-                    css = await resolve_target(live, require(target, action, "target"))
-                    chosen = require(value, action, "value")
-                    try:
-                        if by_label:
-                            await page.select_option(css, label=chosen)
-                        else:
-                            await page.select_option(css, chosen)
-                    except ValueError as exc:
-                        raise NotFound(str(exc)) from exc
-                case "scroll":
-                    if target:
-                        await page.scroll_into_view(await resolve_target(live, target))
-                    else:
-                        dy = delta_y
-                        if dy is None:  # a reader paging: most of a screen, no page JS
-                            metrics = await page.send("Page.getLayoutMetrics")
-                            dy = round(
-                                metrics["cssVisualViewport"]["clientHeight"]
-                                * random.uniform(0.6, 0.9)
-                            )
-                        await page.scroll(delta_y=dy)
-        return await action_result(live, before, want_snapshot=snapshot, action=True)
+        before = await live.page.url()
+        deadline = anyio.current_time() + STEPS_TIMEOUT
+        for index, step in enumerate(todo):
+            try:
+                with anyio.move_on_after(deadline - anyio.current_time()) as call:
+                    if index:
+                        await wait_for_load(live.page)
+                    with anyio.fail_after(timeout):
+                        await perform(live, step, timeout, later=index > 0)
+            except Exception as exc:
+                if steps is None:
+                    raise
+                return await step_failure(live, before, exc, index, todo)
+            if call.cancelled_caught:
+                late = TimeoutError(
+                    f"the call reached {STEPS_TIMEOUT:.0f} s, the limit of one call, "
+                    "before this step finished"
+                )
+                hint = "see what the page shows below, then send what is left in another call"
+                return await step_failure(live, before, late, index, todo, hint)
+        extra = {"steps": len(todo)} if steps else {}
+        return await action_result(
+            live, before, want_snapshot=snapshot, action=True, **extra
+        )
 
 
 @tool("Wait for the page", READ_ONLY)
@@ -851,14 +1238,13 @@ async def surfsky_wait(
     selector: Annotated[
         str | None,
         Field(
-            description="Element to wait for: a CSS selector (works for elements that do not exist yet), @N, or text=words."
+            description="Element to wait for: a CSS selector (also for elements that do not exist yet), or @N "
+            "or text=words, which must resolve now."
         ),
     ] = None,
     gone: Annotated[
         bool,
-        Field(
-            description="With selector: wait until it is absent or has no layout box, instead of present."
-        ),
+        Field(description="With selector: wait until it is absent or has no layout box."),
     ] = False,
     url_contains: Annotated[
         str | None, Field(description="Substring the page URL must contain.")
@@ -876,13 +1262,10 @@ async def surfsky_wait(
 ) -> CallToolResult:
     """Wait until the active tab meets a condition, then return its url and title. Use it
     for content that loads after an action or after a domcontentloaded navigation;
-    actions already settle on their own, so no wait is needed after every step.
-    Conditions: selector present (or gone), url_contains, text on the page, seconds; when
-    several are given they are waited one after another, each with the full timeout. For
-    elements that do not exist yet use a CSS selector: @N and text=words must resolve now.
-    A condition not met in time fails with a timeout error and the page is left as it is.
-    For a condition only script can check, use surfsky_evaluate with an async function
-    that polls.
+    actions settle on their own, so do not wait after every step. Several conditions
+    are waited one after another, each with the full timeout; one not met in time fails
+    with a timeout error and leaves the page as it is. For a condition only script can
+    check, use surfsky_evaluate with an async function that polls.
     """
     if not any([selector, url_contains, text, seconds]):
         raise UsageError("pass selector, url_contains, text or seconds")
@@ -921,7 +1304,7 @@ def find_tab(live: BrowserSession, which: str) -> Any:
     raise UsageError(f"no tab {which!r}; call surfsky_tab list")
 
 
-@tool("Manage tabs", DESTRUCTIVE)
+@tool("Manage tabs", ACTING)
 async def surfsky_tab(
     ctx: Context,
     action: Annotated[
@@ -934,20 +1317,17 @@ async def surfsky_tab(
     tab: Annotated[
         str | None,
         Field(
-            description="Which tab for switch or close: the zero-based index from the last list, or its 8-character id (a prefix is enough)."
+            description="Tab for switch or close: its index from the last list, or its id (a prefix is enough)."
         ),
     ] = None,
     url: Annotated[
         str | None,
-        Field(
-            description="For new: URL to open in the new tab; https:// is added when the scheme is missing."
-        ),
+        Field(description="For new: URL to open in the new tab."),
     ] = None,
 ) -> CallToolResult:
-    """Manage the tabs of a session: list (index, id, url, title, active), new (opens a tab,
-    optionally at url, and makes it active), switch (makes a tab active), close (a tab,
-    default the active one). Use list then switch when a click opened a popup or a
-    target=_blank link: the new page is another tab. Refs belong to a tab: take
+    """Manage the tabs of a session: list (index, id, url, title, active), new (opens a tab
+    and makes it active), switch, close. Use list then switch when a click opened a popup
+    or a target=_blank link: the new page is another tab. Refs belong to a tab: take
     surfsky_snapshot after switching. The session's first tab cannot be closed; navigate
     it instead. The cloud allows five tabs per session.
     """
@@ -995,24 +1375,26 @@ async def surfsky_tab(
         return result({"session_id": live.id, "closed": page.target_id[:8]})
 
 
-@tool("Scrape a URL", READ_ONLY)
+# the one-call path is worth its definition in every conversation; the rest load on demand
+@tool("Scrape a URL", READ_ONLY, meta={"anthropic/alwaysLoad": True})
 async def surfsky_scrape(
     ctx: Context,
     url: Annotated[
         str,
-        Field(description="URL to fetch; https:// is added when the scheme is missing."),
+        Field(description="URL to fetch; https:// is added when missing."),
     ],
     formats: Annotated[
         list[Literal["markdown", "html", "links", "screenshot"]] | None,
         Field(
-            description="One or more of markdown, html, links, screenshot (viewport JPEG). Default: markdown."
+            description="Any of markdown, html, links, screenshot. Default: markdown; add screenshot only "
+            "when the user asks for an image (viewport JPEG)."
         ),
     ] = None,
     only_main_content: OnlyMain = False,
     wait_for: Annotated[
         str | None,
         Field(
-            description="CSS selector to wait for before reading, for content that appears after the load event."
+            description="CSS selector to wait for before reading, for content that appears after load."
         ),
     ] = None,
     wait_until: WaitUntil = "load",
@@ -1023,26 +1405,25 @@ async def surfsky_scrape(
     country: Country = None,
     region: Region = None,
     city: City = None,
-    proxy_type: ProxyType = None,
     os: OS = None,
     block_resources: Blocked = None,
 ) -> CallToolResult:
-    """Fetch one URL and return it as markdown (default), cleaned html, a list of links,
-    and/or a viewport screenshot, with the final url, HTTP status and title. Use it
-    whenever you only need to read a page: the Scraping API serves it from a pre-started
-    browser behind a residential proxy and passes challenge pages and captchas, with no
-    session to stop. profile_uuid (a saved login), proxy, country, region, city,
-    proxy_type or os start a throwaway browser for this call instead: slower, so pass
-    them only when needed. For a page that needs clicks, scrolling, a form or an
-    interactive login, use surfsky_navigate, surfsky_act and surfsky_read. A status of
-    200 with a short page may be a challenge page: read the content before trusting it.
-    Text longer than max_chars is cut with a marker. Each call is billed.
+    """Fetch one URL and return it as markdown (default), cleaned html or links, with the
+    final url, HTTP status and title. Use it whenever you
+    only need to read a page: the Scraping API serves it from a pre-started browser
+    behind a residential proxy and passes challenge pages and captchas, with no session
+    to stop. profile_uuid, proxy, country, region, city or os start a
+    throwaway browser for this call instead: slower, so pass them only when needed. For a
+    page that needs clicks, a form or an interactive login, use surfsky_navigate and
+    surfsky_act. A 200 with a short page may be a challenge page: read the content
+    before trusting it. Text longer than max_chars is cut with a marker. Each call is
+    billed.
     """
     if profile_uuid and os:
         raise UsageError("a profile owns its fingerprint: drop os, or drop profile_uuid")
     wanted = list(formats or ["markdown"])
     options = session_options(
-        proxy, country, region, city, proxy_type, os, None, None, block_resources
+        proxy, country, region, city, os, None, None, block_resources
     )
     client = get_registry(ctx).client()
     text_formats = [name for name in wanted if name != "screenshot"]

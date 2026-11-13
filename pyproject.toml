@@ -26,8 +26,9 @@ classifiers = [
 dependencies = [
     "mcp>=2.2,<3",
     "surfsky>=0.0.24,<0.1",
-    "surfsky-cli>=0.0.11,<0.1",
+    "surfsky-cli>=0.0.12,<0.1",
     "anyio>=4.4",
+    "httpx2>=2.5",
 ]
 
 [project.scripts]
@@ -40,7 +41,7 @@ Repository = "https://github.com/surfskyio/surfsky-mcp"
 Issues = "https://github.com/surfskyio/surfsky-mcp/issues"
 
 [dependency-groups]
-dev = ["pytest>=8.3", "ruff>=0.6", "ty>=0.0.56", "httpx2>=2.5"]
+dev = ["pytest>=8.3", "ruff>=0.6", "ty>=0.0.56"]
 
 [build-system]
 requires = ["hatchling"]

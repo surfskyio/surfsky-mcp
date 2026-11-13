@@ -31,6 +31,22 @@ def test_instructions_fit_the_host_budget():
         assert name in server.INSTRUCTIONS
 
 
+def test_instructions_lead_with_what_survives_a_cut():
+    for text in (server.INSTRUCTIONS, server.HOSTED_INSTRUCTIONS):
+        lead = " ".join(text.split("\n\n")[0].split())
+        assert len(text.encode()) <= 2048 and len(lead) < 400
+        for must in (
+            "surfsky_scrape",
+            "surfsky_act",
+            "bill per minute",
+            "surfsky_session_stop",
+        ):
+            assert must in lead, must
+        flat = " ".join(text.split())
+        assert "insufficient_balance or plan_limit, stop and tell the user" in flat
+        assert "give them the live_url" in flat and "never ask for credentials" in flat
+
+
 def test_transport_security_settings():
     assert server.transport_security("127.0.0.1", []) is None
     custom = server.transport_security("0.0.0.0", ["mcp.example.com"])

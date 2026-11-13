@@ -11,7 +11,7 @@ from surfsky import AuthenticationError, Region, ServerError
 
 from surfsky_mcp import server
 from surfsky_mcp.sessions import Hosted
-from tests.conftest import FakeClient, error_of, server_error, text_of
+from tests.conftest import FakeClient, error_of, header_of, server_error, text_of
 
 pytestmark = pytest.mark.anyio
 
@@ -175,20 +175,20 @@ async def test_started_session_is_the_connections_current_session(hosted):
         assert "surfsky_session_start" in no_session["message"]
         assert not any(c.profiles.started for c in hosted.made)
         started = (await client.call_tool("surfsky_session_start", {})).structured_content
-        moved = (
+        moved = header_of(
             await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
-        ).structured_content
+        )
         assert moved["session_id"] == started["session_id"]
         second = (await client.call_tool("surfsky_session_start", {})).structured_content
-        named = (
+        named = header_of(
             await client.call_tool(
                 "surfsky_navigate",
                 {"url": "https://e.test/a", "session_id": started["session_id"]},
             )
-        ).structured_content
-        current = (
+        )
+        current = header_of(
             await client.call_tool("surfsky_navigate", {"url": "https://e.test/b"})
-        ).structured_content
+        )
     assert named["session_id"] == started["session_id"]  # an explicit id wins
     assert current["session_id"] == second["session_id"]
 
@@ -197,12 +197,12 @@ async def test_two_connections_on_one_token_keep_their_own_session(hosted):
     async with connect(hosted, "tok-de") as one, connect(hosted, "tok-de") as two:
         first = (await one.call_tool("surfsky_session_start", {})).structured_content
         second = (await two.call_tool("surfsky_session_start", {})).structured_content
-        on_one = (
+        on_one = header_of(
             await one.call_tool("surfsky_navigate", {"url": "https://e.test/"})
-        ).structured_content
-        on_two = (
+        )
+        on_two = header_of(
             await two.call_tool("surfsky_navigate", {"url": "https://e.test/"})
-        ).structured_content
+        )
     assert first["session_id"] != second["session_id"]
     assert on_one["session_id"] == first["session_id"]
     assert on_two["session_id"] == second["session_id"]
@@ -217,13 +217,13 @@ async def test_another_token_cannot_use_or_stop_a_session(hosted):
                 "surfsky_navigate", {"url": "https://e.test/", "session_id": sid}
             )
         )
-        assert denied["code"] == "no_session"
+        assert denied["code"] == "session_gone"
         await other.call_tool("surfsky_session_stop", {"session_id": sid})
         listed = (await other.call_tool("surfsky_session_list", {})).structured_content
         assert all(not row["owned"] for row in listed["sessions"])
-        still = (
+        still = header_of(
             await owner.call_tool("surfsky_navigate", {"url": "https://e.test/"})
-        ).structured_content
+        )
     assert still["session_id"] == sid
     owner_api = next(c for c in hosted.made if c.token == "tok-de" and c.profiles.started)
     assert owner_api.profiles.stopped == []
@@ -240,7 +240,7 @@ async def test_session_outlives_its_connection_and_is_stopped_on_shutdown(hosted
         moved = await again.call_tool(
             "surfsky_navigate", {"url": "https://e.test/", "session_id": sid}
         )
-        assert moved.structured_content["session_id"] == sid
+        assert header_of(moved)["session_id"] == sid
     await hosted.accounts.stop_all()
     assert api.profiles.stopped == [sid]
 
@@ -274,28 +274,111 @@ async def test_nothing_is_written_to_disk_and_tokens_stay_out_of_logs(
     assert list(env.iterdir()) == []
     digest = hashlib.sha256(b"tok-de").hexdigest()[:12]
     assert "tok-de" not in caplog.text and digest in caplog.text
+    # the live view URL controls the browser; the test's own MCP client logs what it reads
+    server_side = [r for r in caplog.records if not r.name.startswith("mcp.client")]
+    assert {r.name for r in server_side if "screencast" in r.getMessage()} == set()
 
 
 async def test_hosted_instructions_say_to_start_a_session_first(hosted):
     async with connect(hosted, "tok-de") as client:
         text = client.instructions
     assert "surfsky_session_start" in text and "default session" not in text
+    assert "Keep the session_id it returns" in text
     assert len(text.encode()) <= 2048
     assert "default session" in server.INSTRUCTIONS
+    assert "Keep the session_id" not in server.INSTRUCTIONS
 
 
-async def test_without_a_stable_connection_the_agent_passes_session_id(hosted):
+async def test_without_connections_the_only_session_is_current(hosted):
     """The 2026-07-28 revision has no handshake, so no connection to remember a session for."""
-    async with connect(hosted, "tok-de", mode="auto") as client:
+    async with (
+        connect(hosted, "tok-de", mode="auto") as client,
+        connect(hosted, "tok-de") as legacy,
+    ):
         assert client.protocol_version == "2026-07-28"
+        theirs = (await legacy.call_tool("surfsky_session_start", {})).structured_content
+        not_mine = error_of(
+            await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+        )
+        await legacy.call_tool(
+            "surfsky_session_stop", {"session_id": theirs["session_id"]}
+        )
         sid = (await client.call_tool("surfsky_session_start", {})).structured_content[
             "session_id"
         ]
+        only = await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+        other = (await client.call_tool("surfsky_session_start", {})).structured_content
         unnamed = error_of(
             await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
         )
         named = await client.call_tool(
             "surfsky_navigate", {"url": "https://e.test/", "session_id": sid}
         )
+        await client.call_tool("surfsky_session_stop", {"session_id": sid})
+        left = await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+    assert not_mine["code"] == "no_session"  # a connection's session stays its own
+    assert header_of(only)["session_id"] == sid
     assert unnamed["code"] == "no_session" and "session_id" in unnamed["message"]
-    assert named.structured_content["session_id"] == sid
+    assert header_of(named)["session_id"] == sid
+    assert header_of(left)["session_id"] == other["session_id"]
+
+
+async def test_without_connections_a_connections_earlier_session_is_not_current(hosted):
+    async with (
+        connect(hosted, "tok-de", mode="auto") as client,
+        connect(hosted, "tok-de") as legacy,
+    ):
+        await legacy.call_tool("surfsky_session_start", {})
+        await legacy.call_tool("surfsky_session_start", {})
+        theirs = error_of(
+            await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+        )
+    assert theirs["code"] == "no_session"
+
+
+async def test_session_reaped_under_a_caller_without_a_connection(hosted):
+    async with connect(hosted, "tok-de", mode="auto") as client:
+        started = await client.call_tool("surfsky_session_start", {"idle_timeout": 60})
+        sid = started.structured_content["session_id"]
+        registry = next(iter(hosted.accounts.registries.values()))
+        assert await registry.reap_once(now=registry.sessions[sid].last_used + 61) == [
+            sid
+        ]
+        bare = error_of(
+            await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+        )
+        named = error_of(
+            await client.call_tool(
+                "surfsky_navigate", {"url": "https://e.test/", "session_id": sid}
+            )
+        )
+    assert bare["code"] == "no_session" and "surfsky_session_start" in bare["message"]
+    assert named["code"] == "session_gone" and "surfsky_session_start" in named["hint"]
+
+
+async def test_named_session_is_gone_after_a_restart(hosted):
+    async with connect(hosted, "tok-de") as client:
+        gone = error_of(
+            await client.call_tool(
+                "surfsky_navigate", {"url": "https://e.test/", "session_id": "S1"}
+            )
+        )
+    assert gone["code"] == "session_gone" and "restart" in gone["message"]
+
+
+async def test_steps_run_in_the_connections_session(hosted, fakes):
+    async with connect(hosted, "tok-de") as client:
+        await client.call_tool("surfsky_session_start", {})
+        await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
+        steps = [
+            {"action": "fill", "target": "@1", "text": "hi"},
+            {"action": "press", "key": "Enter"},
+            {"action": "click", "target": "#missing", "by_label": True},
+        ]
+        refused = await client.call_tool("surfsky_act", {"steps": steps})
+        del steps[2]["by_label"]
+        done = await client.call_tool("surfsky_act", {"steps": steps})
+    assert refused.is_error and "by_label" in text_of(refused)
+    page = fakes.browsers[0]
+    assert [call[1] for call in page.called("fill")] == [("a.first", "hi")]
+    assert header_of(done)["steps"] == "3" and '[@1] link "x"' in text_of(done)
