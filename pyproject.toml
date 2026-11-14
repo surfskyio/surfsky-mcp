@@ -25,8 +25,8 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2.2,<3",
-    "surfsky>=0.0.24,<0.1",
-    "surfsky-cli>=0.0.12,<0.1",
+    "surfsky>=0.0.25,<0.1",
+    "surfsky-cli==0.0.12",
     "anyio>=4.4",
     "httpx2>=2.5",
 ]

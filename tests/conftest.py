@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from surfsky import Browser, Inspector, NotFoundError, ServerError, Session
 from surfsky.browser.actions import Keyboard, Mouse
-from surfsky.types import ScrapeResult
+from surfsky.types import ChallengeResult, ScrapeResult
 
 HTML = '<html><body><h1>Hi</h1><p>Text <a href="/x">x</a></p></body></html>'
 WALK = {
@@ -73,15 +73,11 @@ class FakePage(Recorder):
         self.keyboard = FakeKeyboard(self)
         self.mouse = Recorder()
         self.fill_gate = None
-        # the element typing goes to: None when the page gives no value to compare
         self.field = {"editable": True, "value": "", "focused": True}
-        self.stolen = 0  # typing attempts the page moves focus away from
-        self.unfocused = 0  # clicks that leave the field without focus
-        self.challenge = None  # what Captcha.detect reports as challenge_page
-        self.widget = True  # the challenge page shows a widget to solve
-        self.self_passing = 0  # detects after which the challenge page passes by itself
-        self.solve_error = None
-        self.check_error = None  # raised by the read of the field after typing
+        self.focus_steals = 0
+        self.focus_misses = 0
+        self.challenge = ChallengeResult(status="none")
+        self.check_error = None
 
     async def url(self):
         return self._url
@@ -111,8 +107,8 @@ class FakePage(Recorder):
     def typed(self, text, replace=False):
         if self.field is None or self.field["value"] is None:
             return
-        if self.stolen:
-            self.stolen -= 1
+        if self.focus_steals:
+            self.focus_steals -= 1
             self.field["focused"] = False
             return
         self.field["focused"] = True
@@ -122,15 +118,15 @@ class FakePage(Recorder):
         if self.fill_gate is not None:
             await self.fill_gate.wait()
         self.calls.append(("fill", (selector, text), {}))
-        if self.unfocused:
-            self.unfocused -= 1
+        if self.focus_misses:
+            self.focus_misses -= 1
             raise ValueError(f"{selector!r} did not take focus")
         self.typed(text, replace=True)
 
     async def type(self, selector, text):
         self.calls.append(("type", (selector, text), {}))
-        if self.unfocused:
-            self.unfocused -= 1
+        if self.focus_misses:
+            self.focus_misses -= 1
             raise ValueError(f"{selector!r} did not take focus")
         self.typed(text)
 
@@ -170,30 +166,15 @@ class FakePage(Recorder):
 
     async def send(self, method, params=None):
         self.calls.append(("send", (method, params), {}))
-        if method == "Captcha.detect":
-            if self.challenge and self.self_passing:
-                self.self_passing -= 1
-                if not self.self_passing:
-                    self.status, self.challenge = 200, None
-            widget = bool(self.challenge and self.widget)
-            return {
-                "detected": widget,
-                "captcha_type": "turnstile" if widget else None,
-                "selector": "#cf-widget" if widget else None,
-                "challenge_page": self.challenge,
-            }
-        if method == "Captcha.solve":
-            if self.solve_error is not None:
-                raise self.solve_error
-            self.status, self.challenge = 200, None
-            return {
-                "status": "success",
-                "type": "turnstile",
-                "usage": {"cost_usd": 0.0012},
-            }
         if method == "Page.getLayoutMetrics":
             return {"cssVisualViewport": {"clientHeight": 1000}}
         return {}
+
+    async def pass_challenge(self, *, timeout=None, solve=True):
+        self.calls.append(("pass_challenge", (), {"timeout": timeout, "solve": solve}))
+        if isinstance(self.challenge, Exception):
+            raise self.challenge
+        return self.challenge
 
     async def close(self):
         self.closed = True

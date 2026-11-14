@@ -340,99 +340,80 @@ async def test_navigate_history_and_validation(client, fakes):
     assert neither["code"] == "usage"
 
 
-async def test_navigate_solves_a_challenge_page_and_only_that(client, fakes, monkeypatch):
+async def test_navigate_reports_the_challenge_outcome(client, fakes, monkeypatch):
     from surfsky import CDPError
+    from surfsky.types import ChallengeResult
 
     from surfsky_mcp import tools
 
-    monkeypatch.setattr(tools, "CHALLENGE_RELOAD", 0)
-    monkeypatch.setattr(tools, "WIDGET_POLL", 0)
     opened = await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
     browser = fakes.browsers[0]
-    assert "challenge" not in text_of(opened) and not browser.called("send")
+    assert "challenge" not in text_of(opened)
+    [(_, _, params)] = browser.called("pass_challenge")
+    assert params["solve"] is True and 41 < params["timeout"] <= 42
 
-    def solves():
-        return [call[1] for call in browser.called("send") if "solve" in call[1][0]]
+    async def reload(**answer):
+        browser.challenge = ChallengeResult(**answer)
+        result = await client.call_tool("surfsky_navigate", {"go": "reload"})
+        return header_of(result)["note"]
 
-    async def reload():
-        return header_of(await client.call_tool("surfsky_navigate", {"go": "reload"}))
-
-    browser.status = 403  # a block page without a challenge: nothing to solve
-    blocked = await reload()
-    assert blocked["status"] == "403" and "note" not in blocked and not solves()
-
-    # one solve of the widget the scan found: a captcha on the page behind it is not
-    # scanned for, and what the solve cost is said
-    browser.challenge = "cloudflare"
-    passed = await reload()
-    assert passed["note"] == "challenge_page met, solved (billed $0.0012)"
-    assert passed["status"] == "200"
-    [(method, params)] = solves()
-    assert params["type"] == "turnstile" and params["options"] == {
-        "selector": "#cf-widget"
-    }
-    assert 30_000 < params["timeout"] <= 45_000
-
-    browser.status, browser.challenge = 403, "cloudflare"
-    browser.solve_error = CDPError("Failed to solve captcha")
-    failed = header_of(
-        await client.call_tool("surfsky_navigate", {"url": "https://e.test/x"})
+    assert await reload(status="solved", antibot="cloudflare", cost_usd=0.0012) == (
+        "challenge_page met, solved (billed $0.0012)"
     )
-    assert failed["status"] == "403"
-    assert failed["note"].startswith("challenge_page met, not solved")
-    assert "surfsky_scrape" in failed["note"]
+    assert await reload(status="passed") == "challenge_page met, passed"
+    assert await reload(status="passed", reason="load_timeout") == (
+        "challenge_page met, passed; the page may be partly loaded"
+    )
+    for code in ("timeout", "no_solver", "solve_failed"):
+        assert await reload(status="not_solved", reason=code) == (
+            f"challenge_page met, not solved ({code}); surfsky_scrape may get this page"
+        )
+    assert await reload(status="not_solved", reason="solve_failed", cost_usd=0.002) == (
+        "challenge_page met, not solved (solve_failed, billed $0.002); "
+        "surfsky_scrape may get this page"
+    )
+    blocked = (
+        "; start a new session with another fingerprint OS or proxy location, "
+        "or use surfsky_scrape"
+    )
+    assert await reload(status="blocked", antibot="akamai") == f"block_page met{blocked}"
+    assert await reload(status="blocked", cost_usd=0.002) == (
+        f"block_page met (billed $0.002){blocked}"
+    )
 
-    # a challenge page that passes by itself is not solved and not called unsolved
+    # a failed check leaves the navigation result, with a note
+    browser.challenge = CDPError("Failed to pass the challenge")
+    failed = await client.call_tool("surfsky_navigate", {"url": "https://e.test/x"})
+    assert not failed.is_error and header_of(failed)["url"] == "https://e.test/x"
+    assert header_of(failed)["note"] == (
+        "challenge_page check failed; the page may be a challenge page, check its title"
+    )
+
+    # with too little of the call left for the backend and its reply, no check is made
+    monkeypatch.setattr(tools, "NAVIGATE_BUDGET", 12.9)
     browser.calls.clear()
-    browser.status, browser.challenge, browser.widget = 403, "cloudflare", False
-    browser.self_passing = 2
-    own = await reload()
-    assert own["note"] == "challenge_page met, passed" and not solves()
-
-    # so is one that passes while its widget is being solved
-    browser.status, browser.challenge, browser.widget = 403, "cloudflare", True
-    browser.self_passing = 2
-    browser.solve_error = CDPError("the page navigated while the command ran")
-    assert (await reload())["note"] == "challenge_page met, passed"
-
-    # a scan that stops answering proves nothing
-    browser.status, browser.challenge, browser.widget = 403, "cloudflare", False
-    answers = iter([{"challenge_page": "cloudflare", "detected": False}])
-    real = browser.send
-
-    async def send(method, params=None):
-        if method == "Captcha.detect" and (answer := next(answers, None)):
-            return answer
-        raise CDPError("Captcha detection timed out")
-
-    browser.send = send
-    assert "not solved" in (await reload())["note"]
-    browser.send = real
-
-    # with too little of the call left nothing is solved
-    monkeypatch.setattr(tools, "NAVIGATE_BUDGET", tools.MIN_SOLVE - 1)
-    browser.status, browser.challenge, browser.widget = 403, "cloudflare", True
-    browser.solve_error = None
-    browser.calls.clear()
-    late = await reload()
-    assert "not solved" in late["note"] and "no time left" in late["note"]
-    assert not solves()
+    late = header_of(await client.call_tool("surfsky_navigate", {"go": "reload"}))
+    assert late["note"] == "challenge_page not checked, no time left in this call"
+    assert not browser.called("pass_challenge")
 
 
-async def test_navigate_does_not_wait_on_a_scan_that_hangs(client, fakes, monkeypatch):
+async def test_navigate_does_not_wait_on_a_check_that_hangs(client, fakes, monkeypatch):
     from surfsky_mcp import tools
 
-    monkeypatch.setattr(tools, "DETECT_TIMEOUT", 0.05)
     await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
     browser = fakes.browsers[0]
-    browser.status = 403
+    monkeypatch.setattr(tools, "REPLY_MARGIN", 0.04)
+    monkeypatch.setattr(tools, "MIN_CHALLENGE_TIMEOUT", -1.0)
+    monkeypatch.setattr(tools, "NAVIGATE_BUDGET", 0.05)
 
-    async def send(method, params=None):
+    async def pass_challenge(**kwargs):
         await anyio.sleep_forever()
 
-    browser.send = send
+    browser.pass_challenge = pass_challenge
     hung = header_of(await client.call_tool("surfsky_navigate", {"go": "reload"}))
-    assert hung["status"] == "403" and "note" not in hung
+    assert hung["note"] == (
+        "challenge_page check did not answer in time; a solve may have been billed"
+    )
 
 
 async def test_snapshot_lists_refs_and_reports_unreachable(client, fakes):
@@ -810,18 +791,18 @@ async def test_act_typing_is_retried_only_when_nothing_was_typed(
     await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
     browser = fakes.browsers[0]
     fill = {"action": "fill", "target": "#q", "text": "Lisbon", "snapshot": False}
-    browser.unfocused = 1  # a dialog opened under the click: no key was sent
+    browser.focus_misses = 1  # a dialog opened under the click: no key was sent
     assert not (await client.call_tool("surfsky_act", fill)).is_error
     assert len(browser.called("fill")) == 2 and browser.field["value"] == "Lisbon"
     # the keys were sent and the page moved focus: reported, never typed again
     browser.calls.clear()
-    browser.stolen = 1
+    browser.focus_steals = 1
     error = error_of(await client.call_tool("surfsky_act", dict(fill, text="Porto")))
     assert error["code"] == "error" and "moved focus" in error["message"]
     assert len(browser.called("fill")) == 1
     # the error names the agent's target, not the selector the page controls
     await client.call_tool("surfsky_snapshot", {})
-    browser.unfocused = 2
+    browser.focus_misses = 2
     error = error_of(
         await client.call_tool("surfsky_act", dict(fill, target="@1", text="Porto"))
     )
@@ -871,7 +852,7 @@ async def test_act_type_into_the_focused_element_needs_one_that_takes_text(clien
     await client.call_tool("surfsky_navigate", {"url": "https://e.test/"})
     browser = fakes.browsers[0]
     focused = {"action": "type", "target": "@focused", "text": "Lisbon"}
-    browser.stolen = 1
+    browser.focus_steals = 1
     error = error_of(await client.call_tool("surfsky_act", focused))
     assert "moved focus" in error["message"]
     browser.field = {"editable": False, "value": None, "focused": True}  # a button

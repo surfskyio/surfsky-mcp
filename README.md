@@ -156,11 +156,21 @@ sessions, including ones this server did not start.
 `surfsky_scrape` passes most challenge pages itself and each call gets a
 different proxy exit, so a retry often gets through.
 
-`surfsky_navigate` makes at most one solve of a challenge page's own widget,
-billed as a captcha solve where the account pays for solving. The result's `note`
-reads `challenge_page met, solved`, `passed` (the page let the browser through
-without a solve) or `not solved`, with the price when one was charged. It never
-solves a captcha on an ordinary page.
+`surfsky_navigate` gets the browser past a challenge page; captcha solves are
+billed where the account pays for solving. It never solves a captcha on an
+ordinary page. The result's `note` reports what happened, with `(billed $X)`
+when a solve was charged:
+
+- `challenge_page met, solved`
+- `challenge_page met, passed`: the page let the browser through without a solve
+- `challenge_page met, not solved (<reason>)`:
+  - `no_solver`: the account has no solver for this captcha, a retry will not help
+  - `timeout`: it did not pass in time, reload once
+  - `solve_failed`: the solve was tried and failed, reload once or change proxy
+- `block_page met`: the site refused this browser
+- `challenge_page not checked, no time left in this call`: the navigation used the call's time
+- `challenge_page check failed`: the page may be a challenge page, check its title
+- `challenge_page check did not answer in time`: a solve may have been billed
 
 A 200 with a short page, or one asking to prove you are human, is still a
 challenge. If a site blocks every fresh browser, use a session with a saved

@@ -46,14 +46,9 @@ REF_CHECK_LIMIT = 10_000
 ELEMENT_TIMEOUT = 10.0
 MAX_ELEMENT_TIMEOUT = 30.0
 NAV_TIMEOUT = 30.0
-CHALLENGE_STATUS = (401, 403, 429)
 NAVIGATE_BUDGET = 50.0
-DETECT_TIMEOUT = 5.0
-WIDGET_WAIT = 15.0
-WIDGET_POLL = 1.0
-MIN_SOLVE = 15.0
-SOLVE_RESERVE = 8.0
-CHALLENGE_RELOAD = 3.0
+REPLY_MARGIN = 8.0
+MIN_CHALLENGE_TIMEOUT = 5.0
 REFOCUS_WAIT = 0.5
 
 READ_ONLY = ToolAnnotations(
@@ -298,70 +293,32 @@ async def navigate(
     return None
 
 
-async def detect(page: Any) -> dict[str, Any] | None:
-    """What the free captcha scan sees on the page; None when it does not answer."""
+async def challenge_note(page: Any, deadline: float) -> str | None:
+    left = deadline - anyio.current_time()
+    if left - REPLY_MARGIN < MIN_CHALLENGE_TIMEOUT:
+        return "challenge_page not checked, no time left in this call"
     try:
-        with anyio.fail_after(DETECT_TIMEOUT):
-            return await page.send(
-                "Captcha.detect", {"timeout": int(DETECT_TIMEOUT * 1000)}
-            )
-    except (SurfskyError, TimeoutError):
+        with anyio.fail_after(left):
+            outcome = await page.pass_challenge(timeout=left - REPLY_MARGIN)
+    except TimeoutError:
+        return "challenge_page check did not answer in time; a solve may have been billed"
+    except SurfskyError:
+        return "challenge_page check failed; the page may be a challenge page, check its title"
+    if outcome.status == "none":
         return None
-
-
-async def pass_challenge(page: Any, deadline: float) -> str | None:
-    """Get past a bot challenge page with at most one solve, of the widget the scan
-    found on it. Captcha.solve without a type keeps solving until the page has no
-    captcha left, which would also solve, and bill, one on the page behind."""
-    if page.status not in CHALLENGE_STATUS:
-        return None
-    found = await detect(page)
-    if not (found and found.get("challenge_page")):
-        return None
-
-    def left() -> float:
-        return deadline - anyio.current_time()
-
-    widget_until = anyio.current_time() + WIDGET_WAIT
-    while (
-        found
-        and found.get("challenge_page")
-        and not found.get("detected")
-        and left() >= MIN_SOLVE
-        and anyio.current_time() < widget_until
-    ):
-        await anyio.sleep(WIDGET_POLL)
-        found = await detect(page)
-    solved, billed, late = False, "", False
-    if found and found.get("challenge_page") and found.get("detected"):
-        late = left() < MIN_SOLVE
-        if not late:
-            reply = {}
-            with suppress(SurfskyError), anyio.move_on_after(left()):
-                reply = await page.send(
-                    "Captcha.solve",
-                    {
-                        "type": found["captcha_type"],
-                        "options": {"selector": found["selector"]},
-                        # the reload and the scan after it fit in what is left
-                        "timeout": int((left() - SOLVE_RESERVE) * 1000),
-                    },
-                )
-            if cost := (reply.get("usage") or {}).get("cost_usd"):
-                billed = f" (billed ${cost:g})"
-            solved = reply.get("status") == "success"
-            if solved:
-                await anyio.sleep(CHALLENGE_RELOAD)
-                with suppress(SurfskyError):
-                    await page.wait_for_load_state("load", timeout=max(0.5, left() - 2))
-            # also after a failed solve: the page may have passed by itself meanwhile
-            found = await detect(page)
-    if found is not None and not found.get("challenge_page"):
-        outcome = "solved" if solved else "passed"
-    else:  # still there, or the scan gave no answer
-        outcome = "not solved, no time left in this call" if late else "not solved"
-        outcome += "; surfsky_scrape may get this page"
-    return f"challenge_page met, {outcome}{billed}"
+    details = [outcome.reason if outcome.status == "not_solved" else None]
+    if outcome.cost_usd:
+        details.append(f"billed ${outcome.cost_usd:g}")
+    details = ", ".join(filter(None, details))
+    details = f" ({details})" if details else ""
+    if outcome.status == "blocked":
+        return f"block_page met{details}; start a new session with another fingerprint OS or proxy location, or use surfsky_scrape"
+    note = f"challenge_page met, {outcome.status.replace('_', ' ')}{details}"
+    if outcome.status == "not_solved":
+        return f"{note}; surfsky_scrape may get this page"
+    if outcome.reason == "load_timeout":
+        note += "; the page may be partly loaded"
+    return note
 
 
 async def page_state(
@@ -665,9 +622,9 @@ async def surfsky_navigate(
     visible interactive elements with @N refs for surfsky_act; surfsky_snapshot with
     find= or a higher limit lists the rest. Use it for a page that needs clicks,
     scrolling, a form or a login; to only read a page, surfsky_scrape is cheaper and
-    starts no session. A bot challenge page gets one solve of its own widget, billed
-    as a captcha solve where the account pays for solving, and note reports it; a
-    captcha on an ordinary page is never solved here. If note says not solved, or the
+    starts no session. A bot challenge page is passed, captcha solves are billed
+    where the account pays for solving, and note reports it; a captcha on an
+    ordinary page is never solved here. If note says not solved or block_page, or the
     title and snapshot lack the expected content, the page is not the real one
     whatever the status.
     """
@@ -688,7 +645,7 @@ async def surfsky_navigate(
             nav = page.wait_for_load_state(wait_until, timeout=timeout)
         for note in (
             await navigate(page, nav, wait_until, before),
-            await pass_challenge(page, deadline),
+            await challenge_note(page, deadline),
         ):
             if note:
                 live.note = f"{live.note}; {note}" if live.note else note
